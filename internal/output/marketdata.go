@@ -385,18 +385,15 @@ func WriteIndexQuote(w io.Writer, format Format, q domain.IndexQuote) error {
 	case FormatJSON:
 		return writeJSON(w, q)
 	case FormatCSV:
-		cw := csv.NewWriter(w)
-		if err := cw.Write([]string{"code", "name", "open", "high", "low", "close", "change", "change_rate", "high_52w", "low_52w"}); err != nil {
-			return err
-		}
-		if err := cw.Write([]string{
-			q.Code, q.Name, formatFloat(q.Open), formatFloat(q.High), formatFloat(q.Low), formatFloat(q.Close),
-			formatFloat(q.Change), formatFloat(q.ChangeRate), formatFloat(q.High52w), formatFloat(q.Low52w),
-		}); err != nil {
-			return err
-		}
-		cw.Flush()
-		return cw.Error()
+		return writeCSV(w,
+			// Keep the released ten-column prefix stable; append enrichment fields.
+			[]string{"code", "name", "open", "high", "low", "close", "change", "change_rate", "high_52w", "low_52w", "nation", "base", "volume", "price_feed_code", "price_feed_description", "trading_start_at", "trading_end_at", "market_open"},
+			[][]string{{
+				q.Code, q.Name, formatFloat(q.Open), formatFloat(q.High), formatFloat(q.Low), formatFloat(q.Close),
+				formatFloat(q.Change), formatFloat(q.ChangeRate), formatFloat(q.High52w), formatFloat(q.Low52w), q.Nation, formatFloat(q.Base), formatFloat(q.Volume),
+				q.PriceFeed.Code, q.PriceFeed.Description, q.TradingStartAt, q.TradingEndAt, strconv.FormatBool(q.MarketOpen),
+			}},
+		)
 	case FormatTable:
 		sign := ""
 		if q.Change > 0 {
@@ -410,6 +407,13 @@ func WriteIndexQuote(w io.Writer, format Format, q domain.IndexQuote) error {
 		}
 		if q.Volume != 0 {
 			fmt.Fprintf(w, "  %-8s %s\n", i18n.T("output.indexQuote.volume"), formatFloat(q.Volume))
+		}
+		if q.TradingStartAt != "" || q.TradingEndAt != "" {
+			fmt.Fprintf(w, "  %-8s %s - %s\n", i18n.T("output.indexQuote.session"), q.TradingStartAt, q.TradingEndAt)
+		}
+		fmt.Fprintf(w, "  %-8s %t\n", i18n.T("output.indexQuote.marketOpen"), q.MarketOpen)
+		if q.PriceFeed.Code != "" || q.PriceFeed.Description != "" {
+			fmt.Fprintf(w, "  %-8s %s (%s)\n", i18n.T("output.indexQuote.priceFeed"), q.PriceFeed.Code, q.PriceFeed.Description)
 		}
 		return nil
 	default:
@@ -634,15 +638,16 @@ func WriteEarningCalls(w io.Writer, format Format, ec domain.EarningCalls) error
 	case FormatCSV:
 		var csvRows [][]string
 		for _, e := range ec.Events {
-			csvRows = append(csvRows, []string{e.LiveAt, e.CompanyName, e.CompanyCode, e.Title, e.Status, e.Category})
+			csvRows = append(csvRows, []string{strconv.FormatInt(e.EventID, 10), e.LiveAt, e.CompanyName, e.CompanyCode, e.Title, e.Status, e.Category})
 		}
-		return writeCSV(w, []string{"live_at", "company_name", "company_code", "title", "status", "category"}, csvRows)
+		return writeCSV(w, []string{"event_id", "live_at", "company_name", "company_code", "title", "status", "category"}, csvRows)
 	case FormatTable:
 		if len(ec.Events) == 0 {
 			_, err := fmt.Fprint(w, i18n.T("output.earnings.empty"))
 			return err
 		}
 		headers := []string{
+			i18n.T("output.earnings.header.eventID"),
 			i18n.T("output.earnings.header.dateTime"),
 			i18n.T("output.earnings.header.company"),
 			i18n.T("output.earnings.header.category"),
@@ -653,10 +658,10 @@ func WriteEarningCalls(w io.Writer, format Format, ec domain.EarningCalls) error
 			if len(when) >= 16 {
 				when = when[:16]
 			}
-			rows = append(rows, []string{when, e.CompanyName, e.Category})
+			rows = append(rows, []string{strconv.FormatInt(e.EventID, 10), when, e.CompanyName, e.Category})
 		}
 
-		return renderTable(w, headers, rows, AlignLeft, AlignLeft, AlignLeft)
+		return renderTable(w, headers, rows, AlignRight, AlignLeft, AlignLeft, AlignLeft)
 	default:
 		return fmt.Errorf("unsupported output format: %s", format)
 	}
@@ -914,13 +919,26 @@ func WriteNewsBriefing(w io.Writer, format Format, b domain.NewsBriefing) error 
 			if len(it.Keywords) > 0 {
 				header += " · " + strings.Join(it.Keywords, ", ")
 			}
-			fmt.Fprintf(w, "\n[%s]\n", header)
+			if _, err := fmt.Fprintf(w, "\n[%s]\n", header); err != nil {
+				return err
+			}
+			if it.ReasoningTitle != "" || it.AssetName != "" {
+				asset := it.AssetName
+				if it.AssetCode != "" {
+					asset += " (" + it.AssetCode + ")"
+				}
+				if _, err := fmt.Fprintf(w, "  %s · %.2f%% · %s\n", asset, it.ProfitLossRate, it.ReasoningTitle); err != nil {
+					return err
+				}
+			}
 			for _, n := range it.News {
 				agency := n.Agency
 				if agency != "" {
 					agency = " (" + agency + ")"
 				}
-				fmt.Fprintf(w, "  · %s%s\n", n.Title, agency)
+				if _, err := fmt.Fprintf(w, "  · %s%s\n", n.Title, agency); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

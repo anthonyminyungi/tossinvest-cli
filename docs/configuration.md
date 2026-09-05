@@ -23,17 +23,29 @@ tossctl config init
 ```json
 {
   "$schema": "https://raw.githubusercontent.com/JungHoonGhae/tossinvest-cli/main/schemas/config.schema.json",
-  "schema_version": 3,
+  "schema_version": 5,
   "trading": {
     "place": false,
     "sell": false,
     "fractional": false,
     "cancel": false,
     "amend": false,
+    "conditional": false,
     "allow_live_order_actions": false,
     "dangerous_automation": {
       "accept_fx_consent": false
     }
+  },
+  "update_check": {
+    "enabled": true
+  },
+  "openapi": {
+    "enabled": true,
+    "prefer": "auto",
+    "fallback": true
+  },
+  "experimental": {
+    "paper_trading": false
   }
 }
 ```
@@ -46,6 +58,7 @@ tossctl config init
 - `trading.place` — `tossctl order place` 허용 여부
 - `trading.cancel` — `tossctl order cancel` 허용 여부
 - `trading.amend` — `tossctl order amend` 허용 여부
+- `trading.conditional` — `tossctl order conditional place|cancel|modify` 및 대응 ops/MCP 쓰기 허용 여부
 
 **스코프 선언 (유저 자가 제한)**
 - `trading.sell` — `tossctl order place --side sell` 허용 여부. `trading.place`도 함께 켜야 합니다. 끄면 매수만 가능
@@ -54,10 +67,26 @@ tossctl config init
 > 시장(US/KR)은 게이트가 아닙니다. `v0.5.2`에서 비대칭이던 `trading.kr` 토글을 제거했습니다 — KR 주문이 US 주문보다 위험하지 않으므로 시장은 대칭 취급하며, `trading.place` + `allow_live_order_actions` 가 양쪽을 동일하게 게이트합니다. KR 6자리 종목코드는 `--market kr` 없이도 자동 인식됩니다.
 
 **마스터 / 자동화**
-- `trading.allow_live_order_actions` — 실계좌에 도달하는 주문 액션(`place`, `cancel`, `amend`) 자체를 허용. **마스터 킬스위치**로 위 경로 게이트가 켜져 있어도 이 값이 false면 broker에 닿지 않음
+- `trading.allow_live_order_actions` — 실계좌에 도달하는 일반·조건 주문 액션(`place`, `cancel`, `amend`, `conditional`) 자체를 허용. **마스터 킬스위치**로 위 경로 게이트가 켜져 있어도 이 값이 false면 broker에 닿지 않음
 - `trading.dangerous_automation.accept_fx_consent` — post-prepare FX confirmation branch를 자동 수락하고 같은 주문을 계속 진행하도록 허용. 현재는 `prepare` 성공 후 `needExchange > 0`인 미국주식 KRW 매수 경로에만 연결됨
 
-즉, 각 액션은 config에서 먼저 열려 있어야 하고, 그 다음에도 런타임 게이트(`--execute` → `--confirm <token>`)를 통과해야 합니다.
+**실험 기능**
+
+- `experimental.paper_trading` — 롤아웃 중인 미국 옵션 모의투자 명령과 ops/MCP
+  오퍼레이션, 전용 회귀 probe를 노출합니다. 기본값은 `false`입니다. 다음 명령으로만
+  켜거나 끕니다.
+
+  ```bash
+  tossctl config experimental paper-trading --enable
+  tossctl config experimental paper-trading --disable
+  ```
+
+  모의 원장 쓰기는 실거래 config와 별개로 기본 preview 뒤 `--execute`를 요구합니다.
+  이 설정은 실계좌 주문 권한을 부여하지 않습니다. 상류 계약이 최소 3개 연속 build와
+  7일·7회 probe에서 안정되고 공식 UI 일반 공개·상태 일관성·미해결 5xx 없음까지 확인될
+  때만 stable로 승격합니다.
+
+즉, live 주문 액션은 config에서 먼저 열려 있어야 하고, 그 다음에도 런타임 게이트(`--execute` → `--confirm <token>`)를 통과해야 합니다. 모의 원장 쓰기는 위의 별도 `simulation_execute` 경계를 따릅니다.
 
 ## 실행 순서
 
@@ -81,7 +110,8 @@ tossctl이 저장하는 모든 상태 파일과 디렉토리는 소유자 전용
 | `config.json` | `0o600` | 거래 허용 플래그 |
 | `trading-lineage.json` | `0o600` | order ref 추적 |
 | `~/Library/Caches/tossctl/auth/playwright-storage-state.json` (로그인 중간 산출물) | `0o600` | 로그인 성공 직후 자동 삭제 (v0.4.1+) |
-| `--qr-output <path>` PNG (headless 로그인) | `0o600` | `fchmod`로 기존 파일도 강제 |
+| `--link` / `--headless` 로그인 URL | stderr에만 출력 | 일회성 URL이므로 공개 로그에 남기지 않음 |
+| `--qr-output <path>` PNG (link/headless 로그인) | `0o600` | `fchmod`로 기존 파일도 강제 |
 
 **진단:** `tossctl doctor --report` 의 `file_modes` 항목에서 각 파일/디렉토리의 실제 모드와 기대 모드를 JSON으로 확인할 수 있습니다. `ok: false`로 표시되는 항목은 보통 v0.4.0 이전에 생성된 디렉토리(0o755)라, `chmod 0700 ~/Library/Application\ Support/tossctl` 한 번이면 정리됩니다. 기능에는 영향 없음.
 

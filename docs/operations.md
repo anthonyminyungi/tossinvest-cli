@@ -2,6 +2,58 @@
 
 운영 측면의 가이드 — API 회귀 감시 cron 설정, 알림 채널 등.
 
+## WTS build + 일반 Toss Android 버전 감시
+
+저장소의 주간 `WTS API Monitor` workflow는 서로 다른 두 접근 경로를 함께 보되 섞지 않습니다.
+
+- **증권 WTS**: root build ID, 라우트별 rolling deploy에서 관측한 active `build_ids` 집합,
+  chunk 수, endpoint 추가·삭제를 `docs/reverse-engineering/wts-endpoints.json`과 비교합니다.
+  root ID가 같아도 active 집합이 바뀌면 이전/현재 집합을 Discord 알림에 표시합니다. 수집
+  결과가 기존 endpoint의 75% 아래로 급감하거나 root build ID/manifest를 확인할 수 없으면
+  부분 fetch로 판정해 카탈로그를 덮어쓰지 않습니다.
+- **일반 Toss Android 앱**: `viva.republica.toss`의 공개 배포 후보 버전을
+  `docs/reverse-engineering/android-app.json`의 마지막 정적 감사본과 비교합니다. Google Play가
+  안정적인 기계용 version 필드를 제공하지 않아 APKPure 메타데이터를 **비신뢰 후보 신호**로만
+  사용합니다. 후보가 감사본보다 새로우면 `audit_status=stale`로 알리지만, 다운로드·package 및
+  서명 연속성 검증·정적 분석 전에는 감사 완료 버전으로 승격하지 않습니다.
+
+```bash
+ANDROID_DIFF_OUT=/tmp/android_diff.json python3 tools/android_app_monitor.py
+jq . /tmp/android_diff.json
+```
+
+`metadata_source`는 실제 네트워크 조회면 `live`, `--metadata-file` fixture를 쓴 재현
+테스트면 `offline`입니다. 콘솔과 workflow 알림에도 같은 값을 표시하므로 fixture의 가상
+버전이 실제 배포 후보처럼 보이지 않습니다.
+
+이 감시는 모바일 API를 호출하거나 사용자 토큰을 수집하지 않습니다. 앱 버전이 바뀌었다는
+사실만 다음 정적 감사의 트리거로 사용합니다.
+
+## 공식 API 변경의 Codex 정기 분석
+
+`Daily Monitor`는 GitHub-hosted runner에서 공식 REST/AsyncAPI 스펙을 결정적으로 수집하고
+변경분을 보호된 자동화 PR로 기록합니다. 의미 해석은 공개 저장소에 self-hosted runner를 연결하지 않고,
+소유자 Mac의 [`tools/codex_api_analysis.sh`](../tools/codex_api_analysis.sh)가 담당합니다.
+로컬의 ChatGPT 로그인(`codex login`)을 재사용하므로 별도 OpenAI API 키나 API 과금이 없고,
+GitHub에는 Codex OAuth 파일을 저장하지 않습니다.
+
+```bash
+tools/codex_api_analysis.sh --check  # 미분석 spec 변경 여부만 확인
+tools/codex_api_analysis.sh          # 필요할 때만 분석 파일과 PR 생성
+```
+
+Codex 데스크톱 앱을 계속 실행할 수 있으면 공식 **예약** 기능에서 이 작업을 격리 worktree로
+실행하는 구성이 우선입니다. Codex CLI 자체에는 예약 관리 명령이 없으므로 터미널만 사용하는
+환경에서는 macOS `launchd`가 `codex exec` 스크립트를 호출하는 방식이 공식 비대화형 실행 모델에
+맞는 대안입니다. 현재 운영 환경은 이 대안을 사용해 매일 07:20·19:20 KST에 실행합니다.
+GitHub 모니터의 07:00·19:00 KST 수집 뒤 20분 여유를 둔 값입니다. 두 스케줄러를 동시에 켜지
+않습니다. 스크립트는 임시 clone에서만 작업하며,
+가장 최근 스펙 변경이 이미 분석됐으면 아무 변경 없이 종료합니다. 한 날짜에 변경이 둘 이상이면
+두 번째부터 commit 축약값을 파일·브랜치에 붙여 누락을 방지합니다. 공개 PR의 코드를 개인 Mac에서
+실행하지 않는 것이 이 분리의 핵심입니다. GitHub-hosted Codex Action은 별도 OpenAI API 키와 API
+사용량이 필요하고, 개인 ChatGPT 인증 파일을 공개 OSS의 self-hosted runner에 복제하는 방식은
+사용하지 않습니다.
+
 ## API 회귀 감시 (`tossctl monitor api`)
 
 토스 웹 API는 예고 없이 변경됩니다. 과거 두 차례 user-facing 회귀가 있었습니다:
@@ -9,7 +61,11 @@
 - [#15 / #17](https://github.com/JungHoonGhae/tossinvest-cli/issues/15) — User-Agent 핑거프린팅 차단 (v0.3.6 fix)
 - [#29](https://github.com/JungHoonGhae/tossinvest-cli/issues/29) — `/sections/all` body 계약 변경 (v0.4.8 fix)
 
-`monitor api` 명령은 42개 read-only endpoint 를 schema-invariant probe 로 호출해 이런 변경을 사용자보다 먼저 감지합니다.
+`monitor api` 명령은 82개 read-only endpoint 를 schema-invariant probe 로 호출해 이런 변경을 사용자보다 먼저 감지합니다.
+
+`experimental.paper_trading=true`로 옵트인한 경우에는 모의 잔고·교육 요약·대기 주문·완료
+주문 4개를 추가해 총 86개를 검사합니다. 옵트인하지 않은 사용자의 일반 회귀 신호와 아직
+롤아웃 중인 기능의 신호가 섞이지 않도록 기본 목록에서는 제외합니다.
 
 ### 동작 흐름
 
@@ -27,25 +83,32 @@
 
 ### Probe 목록
 
-런타임 목록인 `internal/monitor.Probes()` 가 단일 진실 소스입니다. 36개는
-`internal/ops` 레지스트리의 오퍼레이션 옆 `ProbeSpec` 에서 파생되고, 카탈로그
-오퍼레이션이 없는 CLI 전용 6개만 `internal/monitor/probes.go` 에 직접 선언됩니다.
+런타임 목록인 `internal/monitor.Probes()` 가 단일 진실 소스입니다. 77개는
+`internal/ops` 레지스트리의 오퍼레이션 옆 `ProbeSpec` 또는 공용 probe에서 파생되고,
+카탈로그 오퍼레이션이 없는 CLI 전용 5개만 `internal/monitor/probes.go` 에 직접 선언됩니다.
 
 | 보호 영역 | Probe (개수) |
 | --- | --- |
-| 계좌·포트폴리오 | `account-list`, `account-summary-overview`, `account-receivable`, `account-interest-years`, `account-commission-info`, `portfolio-positions` (6) |
+| 계좌·포트폴리오 | `account-list`, `account-summary-overview`, `account-all-overview`, `account-receivable`, `account-interest-years`, `account-commission-info`, `account-last-login`, `account-margin-frozen`, `account-accident-count`, `portfolio-positions`, `portfolio-folders`, `hidden-holdings`, `trading-simple-trade`, `trading-exchange-choice`, `trading-ats-notification`, `option-real-time-tick`, `securities-transfer-my-accounts`, `securities-transfer-recent-accounts`, `asset-performance-all`, `asset-performance-account`, `asset-snapshots-all`, `asset-snapshots-account`, `asset-snapshot-detail-all`, `asset-snapshot-detail-account` (24) |
 | 주문·자금 | `pending-orders`, `order-funding`, `auto-trades` (3) |
-| 시세·종목 | `quote-stock-infos`, `quote-trades`, `quote-orderbook`, `quote-price-limits`, `quote-charts`, `quote-reasons`, `quote-crypto`, `quote-stock-signals`, `trading-flows`, `option-expiries` (10) |
-| 시장·리서치 | `market-index`, `index-prices`, `stock-ranking`, `investor-rankings`, `theme-rankings`, `sectors-tics`, `ai-signals`, `screener-presets`, `screener-filter-range`, `earning-call`, `earning-call-home`, `news-briefing`, `market-issues`, `market-calendar`, `market-halt`, `market-trading-hours` (16) |
-| 개인화·계좌 부가기능 | `community-rankings`, `lending-expected`, `accumulation-plans`, `profit-overview`, `ria-report`, `watchlist`, `watchlist-groups` (7) |
+| 시세·종목 | `quote-stock-infos`, `quote-trades`, `quote-orderbook`, `quote-price-limits`, `quote-charts`, `quote-reasons`, `quote-crypto`, `quote-stock-signals`, `stock-search`, `trading-flows`, `option-expiries` (11) |
+| 시장·리서치 | `market-index`, `index-prices`, `index-info`, `stock-ranking`, `investor-rankings`, `theme-rankings`, `sectors-tics`, `sector-detail-simple`, `sector-detail-overview`, `sector-detail-stocks`, `sector-detail-etfs`, `sector-detail-news`, `ai-signals`, `ai-signal-detail`, `screener-presets`, `screener-filter-range`, `earning-call`, `earning-call-home`, `earning-call-detail`, `news-briefing`, `market-news-briefing`, `market-issues`, `market-calendar`, `market-key-events`, `market-halt`, `market-trading-hours` (26) |
+| 개인화·계좌 부가기능 | `community-rankings`, `lending-expected`, `lending-top-revenue`, `accumulation-plans`, `profit-overview`, `ria-report`, `open-banking-status`, `open-banking-creatable`, `open-banking-registration`, `auto-trading-open-banking`, `notification-settings`, `notification-inbox-unread`, `notification-reasoning-agreement`, `notification-reasoning-news-count`, `price-alerts`, `watchlist`, `watchlist-groups`, `watchlist-group` (18) |
+| 모의투자(옵트인) | `paper-cash-balance`, `paper-education-summary`, `paper-pending-orders`, `paper-completed-orders` (4) |
 
 이름·method·endpoint 전체 매핑은 [`AGENTS.md`](../AGENTS.md) 의 “Probe 목록”에 있고,
 다음 명령으로 실제 런타임 구성을 검증할 수 있습니다.
 
 ```bash
 go run ./tools/wtsinventory -mode probes -root "$(pwd)" | jq 'length'
-# 42
+# 82
 ```
+
+위 inventory 명령은 사용자 설정과 무관한 안정 표면 82개를 출력합니다. 실제
+`tossctl monitor api`는 옵트인 설정을 읽어 paper probe 4개를 더 실행합니다. WTS 주간 정적 모니터는 별도로
+`rolling_features.paper-trading-us-options`의 UI flag·활성 build·critical endpoint와 stable
+승격 기준 변경을 감시합니다. 현재 `/paper/init`의 불투명한 500이 해결되지 않아 승격 심사는
+`blocked`입니다.
 
 각 probe 는 status 200 + 핵심 JSON 경로 존재 + 타입을 검사합니다. Toss 가 새 필드를 추가하는 변경은 통과시키고, 핵심 필드가 사라지거나 빈 응답을 받으면 실패합니다.
 
@@ -70,25 +133,28 @@ Discord 외 Slack · ntfy · macOS notification · 이메일 등 다른 채널 �
 ```
   ✓ market-index — status=200 (43ms)
   ✓ index-prices — status=200 (53ms)
-  … 40 more probes …
+  … remaining probes …
 
-42 passed, 0 failed
+82 passed, 0 failed, 0 skipped
 ```
+
+계정에 관심종목 폴더가 하나도 없으면 `watchlist-group` 상세 probe는 적용할 대상이 없어
+`skipped`가 됩니다. 이는 정상 상태이며 exit code는 0입니다(예: `81 passed, 0 failed, 1 skipped`).
 
 실패 (예: #29 같은 body-contract 회귀):
 
 ```
   ✗ portfolio-positions — status=200: result.sections is empty — likely body-contract regression (#29-class)
-… 41 passing probes omitted …
+… 81 passing probes omitted …
 
-41 passed, 1 failed
+81 passed, 1 failed, 0 skipped
 ```
 
 webhook 페이로드:
 
 ```
 🚨 tossctl API regression detected (0.4.9)
-2026-05-13 10:00 UTC — 1/42 probes failed
+2026-05-13 10:00 UTC — 1/82 probes failed
 
 ❌ portfolio-positions — POST wts-cert-api.tossinvest.com/api/v2/dashboard/asset/sections/all
     status=200, result.sections is empty — likely body-contract regression (#29-class)
@@ -97,8 +163,12 @@ webhook 페이로드:
 ### 새 probe 추가
 
 새 read-only endpoint 의존이 카탈로그 오퍼레이션에 연결되면 해당 `internal/ops`
-항목에 `ProbeSpec` 을 같이 선언합니다. 오퍼레이션·probe 소유권이 한 곳에 남아 MCP,
-CLI, monitor 계약이 같이 바뀔 수 있습니다.
+항목에 `ProbeSpec` 을 같이 선언합니다. 여러 HTTP 요청을 합치는 오퍼레이션이면 첫
+의존성은 `Probe`, 나머지는 `ExtraProbes`에 선언해 모든 요청 계약을 감시합니다.
+오퍼레이션·probe 소유권이 한 곳에 남아 MCP, CLI, monitor 계약이 같이 바뀔 수 있습니다.
+공용 의존성은 `ProbeRefs`로 이름을 참조해 실제 probe는 한 번만 실행합니다. 계좌 범위
+요청은 `AccountScoped: true`로 표시하면 monitor가 먼저 검증한 `account-list` 응답에서
+기본 계좌 키를 구해 `accountKey` 헤더로 넣습니다.
 
 ```go
 Probe: &ProbeSpec{

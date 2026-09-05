@@ -16,12 +16,19 @@ tossctl auth status      # Session: active / Live Check: valid 여야 함
 Every leaf command carries machine-readable annotations:
 
 - `source`: `official` (official Open API only), `wts` (WTS internal endpoint only),
-  or `both` (official preferred, WTS fallback). `wts` endpoints are unofficial and
-  may change without notice.
+  `both` (official preferred, WTS fallback), or `local` (no remote API call). `wts`
+  endpoints are unofficial and may change without notice.
 - `mutating: true`: the command can change account state (live trading). It is
   attached to `order place`, `order cancel`, `order amend`, `order conditional
   place|cancel|modify`, and `ops call` (because that generic dispatcher can
   invoke write operations).
+- `writes_state: true`: a non-trading command changes a preference or resource.
+  `writes_state: possible` on `ops call` means the selected operation decides;
+  inspect its `mutation` policy before calling it.
+- `environment`: `live` or `paper` when the target ledger matters. It is
+  independent of product `domain` and credential `source`.
+- `experimental`: the opt-in feature gate. `paper-trading` is hidden and blocked
+  unless `experimental.paper_trading=true`.
 
 Rules for agents:
 
@@ -29,7 +36,17 @@ Rules for agents:
   live order. Trading is also gated in `config.json` (disabled by default).
 - **Preview before placing.** Use `order preview` to validate a canonical order
   intent, then let a human run `order place`.
-- Prefer `--json` for machine-readable output.
+- `writes_state: true` 명령도 먼저 preview합니다. 사용자의 현재 요청이 그 정확한
+  변경을 승인한 경우에만 방금 조회한 영향 상태·intent에 결합된 `confirm_token`으로 실행하고, 불가역 작업은 별도
+  acknowledgement까지 확인합니다. Open API IP 교체·목표가 알림·숨김 종목·관심종목
+  폴더/종목 관리가 이 범주입니다.
+- paper 명령은 실거래 `mutating: true`가 아니라 `writes_state: true`,
+  `mutation_risk: simulation`, `authorization: simulation_execute`입니다. 그래도
+  `--execute`는 사용자가 현재 요청에서 모의 원장 변경을 명시적으로 허용한 경우에만
+  사용합니다. paper 승인을 live 승인으로 재사용하지 말고, `paper order live-preview`가
+  만든 결과도 사람이 일반 live confirm 경계를 다시 통과하게 둡니다.
+- Open API IP 교체는 새 IP 추가와 검증을 먼저 하고, 실패하면 기존 목록을 복구합니다.
+- Prefer `--output json` for machine-readable output.
 - Treat `source: wts` results as best-effort; add a `monitor api` probe when you
   build automation on top of them.
 - **Don't auto-run `tossctl update`.** It changes the tossctl binary itself
@@ -78,29 +95,49 @@ Rules for agents:
 
 ## Probe 목록
 
-현재 `monitor api` 는 42개 read-only endpoint 를 감시합니다. 단일 진실 소스는
+현재 `monitor api` 는 82개 read-only endpoint 를 감시합니다. 단일 진실 소스는
 `internal/monitor.Probes()` 런타임 결과입니다. 대부분은 `internal/ops`
-레지스트리의 오퍼레이션 옆 `ProbeSpec` 에서 파생되고, 카탈로그 오퍼레이션이
-없는 CLI 전용 6개만 `internal/monitor/probes.go` 에 직접 선언됩니다.
+레지스트리의 오퍼레이션 옆 `ProbeSpec`과 공용 `ProbeRefs`에서 파생되고, 카탈로그
+오퍼레이션이 없는 CLI 전용 5개만 `internal/monitor/probes.go` 에 직접 선언됩니다.
+`experimental.paper_trading=true`인 사용자는 여기에 paper 잔고·교육 요약·대기 주문·완료
+주문 4개 probe가 더해집니다. 실험 기능 실패가 옵트인하지 않은 사용자의 안정 표면 장애로
+보이지 않도록 기본 목록과 분리합니다.
+
+실험 기능은 endpoint 구현 여부와 별도로 `docs/reverse-engineering/wts-endpoints.json`의
+`rolling_features`에서 UI flag, 활성 WTS build, critical endpoint, live 관측과 stable 승격
+심사를 추적합니다. 최소 3개 연속 build, 7일·7회 연속 probe, 공식 UI 일반 공개, 상태
+일관성, 미해결 5xx 없음이 모두 확인되기 전에는 experimental 표기를 제거하지 않습니다.
 
 - `market-index` — `GET /api/v1/dashboard/wts/overview/indicator/index`
 - `index-prices` — `GET /api/v1/index-prices/KGG01P`
+- `index-info` — `GET /api/v2/index-infos/KGG01P`
 - `stock-ranking` — `GET /api/v1/rankings/realtime/stock`
 - `investor-rankings` — `GET /api/v1/dashboard/wts/overview/rankings/by-investors`
 - `theme-rankings` — `GET /api/v1/tics/rankings`
 - `sectors-tics` — `GET /api/v1/tics/all`
+- `sector-detail-simple` — `GET /api/v2/dashboard/wts/overview/tics/1/simple`
+- `sector-detail-overview` — `GET /api/v2/dashboard/wts/overview/tics/1/overview`
+- `sector-detail-stocks` — `POST /api/v2/dashboard/wts/overview/tics/1/stocks`
+- `sector-detail-etfs` — `POST /api/v2/dashboard/wts/overview/tics/1/etfs`
+- `sector-detail-news` — `GET /api/v2/dashboard/wts/overview/tics/1/news`
 - `ai-signals` — `GET /api/v2/reasoning-contents/interest`
+- `ai-signal-detail` — `GET /api/v1/dashboard/wts/overview/ai-signals/detail?productCode=A005930&productType=STOCKS`
 - `screener-presets` — `GET /api/v2/screener/presets/common`
+- `stock-search` — `POST /api/v2/search/stocks`
 - `trading-flows` — `GET /api/v1/stock-infos/trade/trend/trading-trend`
 - `earning-call` — `GET /api/v1/earning-call/upcoming`
-- `news-briefing` — `GET /api/v1/dashboard/wts/overview/ai-signals/personalized`
+- `earning-call-detail` — `GET /api/v1/earning-call/events/228692/info`
+- `news-briefing` — `GET /api/v2/reasoning/personalized`
+- `market-news-briefing` — `GET /api/v1/dashboard/wts/overview/ai-signals/latest?nationCode=KOR`
 - `community-rankings` — `GET /api/v1/community/top-rankings/INFLUENCER`
 - `lending-expected` — `GET /api/v1/lending/revenue/account/expected`
+- `lending-top-revenue` — `GET /api/v1/lending/revenue/account/top-revenue`
 - `accumulation-plans` — `GET /api/v2/autotrade/plan/find`
 - `profit-overview` — `POST /api/v1/profit/overview`
 - `market-issues` — `GET /api/v1/lens/issues`
 - `auto-trades` — `GET /api/v3/trading/auto-trading/histories`
 - `market-calendar` — `POST /api/v4/calendar/monthly/<YYYY-MM>`
+- `market-key-events` — `GET /api/v1/calendar/ai-summary/key-events`
 - `quote-charts` — `POST /api/v1/dashboard/common/stocks/mini-chart`
 - `quote-reasons` — `POST /api/v1/dashboard/wts/overview/ai-signals`
 - `market-halt` — `GET /api/v4/dashboard/wts/overview/indicator`
@@ -113,11 +150,39 @@ Rules for agents:
 - `ria-report` — `GET /api/v1/ria-calculator/report`
 - `account-interest-years` — `GET /api/v1/interest/accounts/annual/history/years`
 - `account-commission-info` — `GET /api/v2/trading/commission-info`
+- `account-last-login` — `GET /api/v1/user/last-login-info`
+- `account-margin-frozen` — `GET /api/v1/margin/cert/frozen-account` (`accountKey`)
+- `account-accident-count` — `GET /api/v2/account/unlock/accident-account/count` (`accountKey`)
 - `account-summary-overview` — `GET /api/v3/my-assets/summaries/markets/all/overview`
+- `account-all-overview` — `POST /api/v1/dashboard/all-accounts`
+- `asset-performance-all` — `GET /api/v1/asset-snapshot/all-accounts/chart/ONE_MONTH/DAY`
+- `asset-performance-account` — `GET /api/v1/asset-snapshot/chart/ONE_MONTH/DAY` (`accountKey`)
+- `asset-snapshots-all` — `GET /api/v1/asset-snapshot/all-accounts/page?pageSize=1`
+- `asset-snapshots-account` — `GET /api/v1/asset-snapshot/page?pageSize=1` (`accountKey`)
+- `asset-snapshot-detail-all` — `GET /api/v1/asset-snapshot/all-accounts/detail-by-date?baseDate=<today>`
+- `asset-snapshot-detail-account` — `GET /api/v1/asset-snapshot/detail-by-date?baseDate=<today>` (`accountKey`)
+- `portfolio-folders` — `POST /api/v2/dashboard/asset/sections/all` (`FOLDER_OVERVIEW_V2`, `accountKey`)
+- `open-banking-status` — `GET /api/v1/autotrade/open-banking/info/find`
+- `open-banking-creatable` — `GET /api/v1/autotrade/open-banking/creatable`
+- `open-banking-registration` — `GET /api/v1/autotrade/open-banking/need-registration`
+- `auto-trading-open-banking` — `GET /api/v1/trading/open-banking/auto-trading`
+- `trading-simple-trade` — `GET /api/v1/trading/settings/simple-trade`
+- `trading-exchange-choice` — `GET /api/v2/trading/settings/investor-exchange-choice-type`
+- `trading-ats-notification` — `GET /api/v1/users/settings/me/ats-notification`
+- `option-real-time-tick` — `GET /api/v1/member-subscriptions/get-option-real-time-tick`
+- `securities-transfer-my-accounts` — `GET /api/v1/securities-transfer/my-accounts`
+- `securities-transfer-recent-accounts` — `GET /api/v1/securities-transfer/recent-accounts`
+- `notification-settings` — `GET /api/v1/user-alimies`
+- `notification-inbox-unread` — `GET /api/v1/inbox-alimies/has-unread`
+- `notification-reasoning-agreement` — `GET /api/v1/reasoning/agreement`
+- `notification-reasoning-news-count` — `GET /api/v1/reasoning-news/count`
+- `price-alerts` — `GET /api/v1/user-price-alimy/A005930`
+- `hidden-holdings` — `GET /api/v2/hidden-stocks`
 - `portfolio-positions` — `POST /api/v2/dashboard/asset/sections/all`
 - `pending-orders` — `GET /api/v1/trading/orders/histories/all/pending`
 - `watchlist` — `GET /api/v1/new-watchlists`
 - `watchlist-groups` — `GET /api/v1/new-watchlists/groups/simple`
+- `watchlist-group` — `GET /api/v1/new-watchlists/groups?ids=<first-user-folder-id>&includePrice=true`
 - `earning-call-home` — `GET /api/v1/earning-call/home`
 - `account-list` — `GET /api/v1/account/list`
 - `quote-stock-infos` — `GET /api/v2/stock-infos/A005930`
@@ -126,6 +191,16 @@ Rules for agents:
 - `quote-price-limits` — `GET /api/v2/stock-prices/A005930/upper-lower`
 - `market-trading-hours` — `GET /api/v2/system/trading-hours/integrated`
 
+옵트인 전용 paper probe:
+
+- `paper-cash-balance` — `GET /api/v1/paper/cash-balance`
+- `paper-education-summary` — `GET /api/v1/paper/education/summary`
+- `paper-pending-orders` — `GET /api/v1/paper/trading/orders/histories/all/pending`
+- `paper-completed-orders` — `GET /api/v2/paper/trading/my-orders/markets/us-opt/by-date/completed`
+
 새 카탈로그 endpoint 의존이 생기면 해당 `internal/ops` 오퍼레이션에 `ProbeSpec`을
-붙입니다. CLI 전용 의존성만 `internal/monitor/probes.go` 에 추가합니다. 가이드:
+붙입니다. 한 기능이 여러 endpoint를 합치면 나머지는 `ExtraProbes`에 모두 선언하고,
+여러 오퍼레이션이 같은 요청을 공유하면 공용 probe 하나를 `ProbeRefs`로 참조합니다.
+`AccountScoped` probe는 monitor가 `account-list`에서 확인한 기본 `accountKey`를 넣습니다.
+CLI 전용 의존성만 `internal/monitor/probes.go` 에 추가합니다. 가이드:
 `docs/operations.md`.

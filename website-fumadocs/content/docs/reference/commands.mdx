@@ -10,9 +10,9 @@ description: tossctl 전체 명령
 
 | 명령 | 설명 |
 |------|------|
-| `tossctl auth login [--headless] [--qr-output <path>]` | QR + 폰 승인 로그인 |
+| `tossctl auth login [--link] [--headless] [--qr-output <path>]` | QR 또는 휴대폰에서 누르는 링크 + 폰 승인 로그인 |
 | `tossctl auth status` | 세션 유효성·만료 확인 |
-| `tossctl auth extend [--timeout 120s]` | 폰 푸시 승인으로 세션 연장(~7일) |
+| `tossctl auth extend [--timeout 120s] [--if-expiring 48h]` | 폰 푸시 승인으로 세션 연장(~7일); 충분히 남았으면 선택적으로 건너뜀 |
 
 ## 계좌 · 포트폴리오
 
@@ -22,10 +22,16 @@ description: tossctl 전체 명령
 | `tossctl account summary` | 총자산·평가손익·시장별 |
 | `tossctl portfolio positions` | 보유 종목 (미국은 USD 병기) |
 | `tossctl portfolio allocation` | 자산 배분 |
+| `tossctl portfolio folders [--account <key>]` | 사용자 정의 폴더별 보유종목·수수료 반영 평가손익(계좌·폴더 내부 키 비노출) |
+| `tossctl portfolio performance [--account <key>]` | 최근 1개월 일별 원금·평가액·수익률·기간 고저(기본: 모든 증권 계좌 합산) |
+| `tossctl portfolio snapshots [--account <key>] [--cursor <key>] [--limit N]` | 커서 기반 날짜별 포트폴리오 평가 이력 |
+| `tossctl portfolio snapshot <YYYY-MM-DD> [--account <key>]` | 특정 날짜의 시장·보유종목별 전체 평가 상세 |
 | `tossctl portfolio dividends [--year N] [--by-payment-date]` | 연간 배당 내역(총액·지역·월별·세금) |
+| `tossctl portfolio hidden list [--account <key>]` | 증권 포트폴리오에서 숨긴 보유종목 조회(계좌 키 비노출) |
+| `tossctl portfolio hidden hide\|show <symbol> [--execute --confirm <token>]` | 보유종목 숨김·복원 preview/confirm |
 | `tossctl profit` | 누적 실현손익 (매매손익·배당·대여·만기·예탁금이자, KRW/USD) |
 | `tossctl tax overseas [--year N]` | 해외주식 양도소득 (세율·공제·종목별 손익 — 세금 신고용) |
-| `tossctl accumulate list` | 주식모으기(정기 자동매수) 전체 설정 — 📱 모바일 앱 전용 기능 |
+| `tossctl accumulate list` | 주식모으기 전체 설정 — 📱 증권 모바일 화면에서 발견 후 WTS 호출 검증 |
 | `tossctl accumulate status <symbol>` | 특정 종목의 주식모으기 설정 (Active/Paused) |
 
 ## 시세 (quote)
@@ -41,18 +47,23 @@ description: tossctl 전체 명령
 | `tossctl quote warnings <symbol>` | 매수 유의사항 |
 | `tossctl quote sellable <symbol>` | 매도가능수량 |
 | `tossctl quote commission <symbol>` | 수수료율·거래세율 |
+| `tossctl quote alert list <symbol>` | 증권 목표가 알림 조회 |
+| `tossctl quote alert add\|remove <symbol> --price N --currency KRW\|USD [--execute --confirm <token>]` | 목표가 알림 변경 preview/confirm |
 
 ## 시장 (market)
 
 | 명령 | 설명 |
 |------|------|
-| `tossctl market index [<코드\|이름>]` | 주요 지수 목록 / 인자 주면 상세(OHLC·52주) |
+| `tossctl market index [<코드\|이름>]` | 주요 지수 목록 / 인자 주면 상세(OHLC·52주·시세원·장 시작/종료·운영 여부) |
 | `tossctl market ranking --size N` | 실시간 인기 종목 |
 | `tossctl market investors` | 투자자별(외국인·기관·개인) 순매수 상위 |
 | `tossctl market sectors [<id>]` | 업종별 등락(대분류/하위, 1일·1개월·1년) |
-| `tossctl market earnings [--major]` | 어닝콜 일정 / 주요 기업 |
-| `tossctl market briefing` | 개인화 AI 뉴스 브리핑(테마별) |
+| `tossctl market sector <id>` | 업종 현재 등락·연관 업종·구성 종목·ETF·뉴스 집계 |
+| `tossctl market earnings [event-id]` | 어닝콜 일정 / ID 지정 시 보고서·오디오·대본·발표자료 링크 (`--major`: 주요 기업) |
+| `tossctl market briefing` | 개인화 AI 뉴스 브리핑(보유·관심 종목, 수익률, AI 사유, 뉴스·관련 종목) |
+| `tossctl market key-events` | 현재 핵심 실적·경제지표(예상·발표·직전값) |
 | `tossctl market signals` | 토스 AI 시그널 |
+| `tossctl market signal <symbol> [--type stocks\|equity_etf]` | 종목·ETF 하나의 AI 시그널 전체 근거·뉴스·연관 종목 |
 | `tossctl market fx` | 환율·달러 인덱스 |
 | `tossctl market hours` | 장 운영 시간 |
 | `tossctl market screener [<preset-id>] [--filter '<json>'] [--nation kr\|us]` | 조건검색 |
@@ -71,8 +82,8 @@ description: tossctl 전체 명령
 |------|------|
 | `tossctl order preview --symbol <s> --side <buy\|sell> --qty <n> --price <p>` | dry-run 미리보기(주문 안 나감) |
 | `tossctl order place ... --execute --confirm <token>` | 실제 주문(2단계 게이트) |
-| `tossctl order cancel --order-id <id> --symbol <s>` | 주문 취소 |
-| `tossctl order amend --order-id <id> ...` | 주문 정정 |
+| `tossctl order cancel --order-id <id> --symbol <s> [--execute --confirm <token>]` | 기본 preview; 같은 명령의 token으로 주문 취소 |
+| `tossctl order amend --order-id <id> ... [--execute --confirm <token>]` | 기본 preview; 같은 명령의 token으로 주문 정정 |
 | `tossctl orders list` · `orders completed` · `order show <id>` | 미체결/체결/단건 조회 |
 
 소수점(금액 기반) 주문: `order place --fractional --amount <krw> --qty 0` (미국 시장가).
@@ -85,17 +96,29 @@ description: tossctl 전체 명령
 | `tossctl transactions overview --market us\|kr` | 주문가능·출금가능·예정입금 |
 | `tossctl export positions\|orders --market us\|kr\|all` | CSV 내보내기 |
 
+## 계좌 부가기능 · 알림
+
+| 명령 | 설명 |
+|------|------|
+| `tossctl account overview [--full]` | 전체·미성년 계좌 자산(계좌번호 기본 마스킹) |
+| `tossctl account trading-settings [--account <key>]` | 증권 계좌별 간편주문과 사용자 공통 KRX/NXT·ATS 알림·옵션 실시간 시세 설정 조회(읽기 전용) |
+| `tossctl account transfer-accounts [--account <key>] [--full]` | 증권 주식이체용 내·최근 계좌 조회(번호 기본 마스킹, 이체 실행 없음) |
+| `tossctl account access-status [--account <key>]` | 최근 증권 접속 환경과 계좌별 신용거래 동결·사고계좌 상태(읽기 전용, 원래 계좌 키 미출력) |
+| `tossctl accumulate funding-status [--full]` | 증권 주식모으기 자금연결·자동주문 등록 상태(`banking status`는 deprecated alias; 일반 Banking/MyData 아님, 예금주·계좌번호 기본 마스킹, 내부 ID 항상 미출력) |
+| `tossctl notifications list` | WTS 알림 설정 조회(읽기 전용, 내부 사용자 ID 제외) |
+| `tossctl notifications status` | 통합 알림 설정·받은함 미확인·AI 분석 동의 상태 조회(읽기 전용) |
+
 ## 관심종목 (watchlist)
 
 | 명령 | 설명 |
 |------|------|
 | `tossctl watchlist list [<group-id>] [--all]` · `watchlist groups` | 관심종목 폴더별 조회 / 폴더 목록 |
-| `tossctl watchlist group create\|rename\|delete` | 폴더 관리 |
-| `tossctl watchlist add\|remove --group <id>` | 종목 추가/제거 |
+| `tossctl watchlist group create\|rename\|delete [--execute --confirm <token>]` | 폴더 변경 preview/confirm; 삭제는 `--acknowledge-irreversible` 추가 필요 |
+| `tossctl watchlist add\|remove <symbol or name> --group <id> [--execute --confirm <token>]` | 종목 추가/제거 preview/confirm |
 
 ## 공식 Open API · 자동 라우팅
 
-공식 키를 연결하면 공식이 지원하는 조회·거래는 공식 OAuth 경로로 처리되고(자동 토큰 갱신), 나머지는 WTS 경로를 씁니다. 키 없이도 모든 기능이 동작합니다. 자세한 내용은 [자동 라우팅 가이드](/docs/guide/hybrid-openapi).
+공식 키를 연결하면 공식이 지원하는 조회·거래는 공식 OAuth 경로로 처리되고(자동 토큰 갱신), 나머지는 WTS 경로를 씁니다. WTS 기능은 웹 세션만으로 동작하지만 `account buying-power`, `market business-days|stocks`, `quote metadata`, 조건주문, `stream`은 공식 키가 필요합니다. 자세한 내용은 [자동 라우팅 가이드](/docs/guide/hybrid-openapi).
 
 | 명령 | 설명 |
 |------|------|
@@ -103,6 +126,8 @@ description: tossctl 전체 명령
 | `tossctl openapi login` | 공식 API Key·Secret 등록(환경변수·플래그·대화형, 파일 `0600`) |
 | `tossctl openapi status` | 키·토큰·허용 IP·라우팅 진단 |
 | `tossctl openapi test` | 실제 호출로 연결 검증 |
+| `tossctl openapi ip list` | 현재 허용 IP 목록 조회(WTS 세션 필요) |
+| `tossctl openapi ip replace-current` | 현재 공인 IP로 교체 계획 preview; `--execute --confirm <token>`으로 적용 |
 | `tossctl openapi logout` | 자격증명 파일 삭제 |
 | `tossctl <명령> --backend auto\|wts\|openapi` | 요청별 라우팅 백엔드 지정(전역, 기본 auto) |
 

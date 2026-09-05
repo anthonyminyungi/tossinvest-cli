@@ -11,7 +11,7 @@
     },
     "schema_version": {
       "type": "integer",
-      "const": 4
+      "const": 5
     },
     "trading": {
       "type": "object",
@@ -34,6 +34,10 @@
           "default": false
         },
         "amend": {
+          "type": "boolean",
+          "default": false
+        },
+        "conditional": {
           "type": "boolean",
           "default": false
         },
@@ -83,7 +87,8 @@
         },
         "prefer": {
           "type": "string",
-          "enum": ["auto", "wts", "official"],
+          "enum": ["auto", "wts", "openapi", "official"],
+          "description": "Hybrid routing preference. 'official' is a deprecated alias for 'openapi'.",
           "default": "auto"
         },
         "fallback": {
@@ -91,6 +96,18 @@
           "default": true
         }
       }
+    },
+    "experimental": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paper_trading": {
+          "type": "boolean",
+          "default": false,
+          "description": "Expose rolling-out US-options paper-trading commands and operations."
+        }
+      },
+      "required": ["paper_trading"]
     }
   },
   "required": [

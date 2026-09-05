@@ -10,8 +10,11 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,49 +26,46 @@ import (
 
 // Probe describes one endpoint to validate.
 type Probe struct {
-	Name   string
-	Method string
-	URL    string
-	Body   string
-	Check  func(status int, body []byte) error
+	Name                 string
+	Method               string
+	URL                  string
+	Body                 string
+	AccountScoped        bool
+	WatchlistGroupScoped bool
+	Check                func(status int, body []byte) error
 }
 
 // Result of one probe execution.
 type Result struct {
 	Probe    Probe
 	OK       bool
+	Skipped  bool // valid state made a state-dependent probe inapplicable
 	Status   int
 	Duration time.Duration
-	Detail   string // failure detail; empty if OK
+	Detail   string // failure or skip detail; empty on an ordinary pass
 }
 
 // Probes returns the read-only endpoints we monitor.
 //
 // Most probes are declared next to their operation in the internal/ops
-// registry (one entry = the operation + its probe) and derived here. The
+// registry (an operation owns probes for all of its HTTP dependencies) and
 // remainder are CLI-surface probes with no registry operation (quote/market
 // commands that call the WTS client directly) and stay hand-listed below.
 //
 // Each probe's Check is a schema invariant — the smallest assertion that
 // catches a contract change like #29 without false-positiving on Toss
 // adding/removing unrelated fields.
-func Probes() []Probe {
+func Probes(enabledExperiments ...string) []Probe {
 	const (
 		api  = "https://wts-api.tossinvest.com"
 		info = "https://wts-info-api.tossinvest.com"
 	)
 	var out []Probe
-	for _, spec := range ops.NewCatalog().Probes() {
-		out = append(out, Probe{Name: spec.Name, Method: spec.Method, URL: spec.URL, Body: spec.Body, Check: spec.Check})
+	for _, spec := range ops.NewCatalog(enabledExperiments...).Probes() {
+		out = append(out, Probe{Name: spec.Name, Method: spec.Method, URL: spec.URL, Body: spec.Body, AccountScoped: spec.AccountScoped, WatchlistGroupScoped: spec.WatchlistGroupScoped, Check: spec.Check})
 	}
 	// CLI-surface probes without a registry operation (covered by cmd quote/market).
 	out = append(out,
-		Probe{
-			Name:   "account-list",
-			Method: "GET",
-			URL:    api + "/api/v1/account/list",
-			Check:  statusAndPath("result.accountList", "array"),
-		},
 		Probe{
 			Name:   "quote-stock-infos",
 			Method: "GET",
@@ -127,26 +127,115 @@ const maxConcurrentProbes = 8
 // Run executes all probes concurrently (bounded by maxConcurrentProbes) using
 // the session for auth. Results are returned in probe order regardless of
 // completion order, so output stays stable.
-func Run(ctx context.Context, sess *session.Session) []Result {
-	probes := Probes()
+func Run(ctx context.Context, sess *session.Session, enabledExperiments ...string) []Result {
+	probes := Probes(enabledExperiments...)
 	results := make([]Result, len(probes))
+	accountListIndex := -1
+	watchlistGroupsIndex := -1
+	accountKey := ""
+	var watchlistGroupID int64
+	for i, probe := range probes {
+		if probe.Name == "account-list" {
+			accountListIndex = i
+			var body []byte
+			results[i], body = executeProbe(ctx, sess, probe, "")
+			if results[i].OK {
+				accountKey = accountKeyFromList(body)
+			}
+			break
+		}
+	}
+	for i, probe := range probes {
+		if probe.Name != "watchlist-groups" {
+			continue
+		}
+		watchlistGroupsIndex = i
+		var body []byte
+		results[i], body = executeProbe(ctx, sess, probe, "")
+		if results[i].OK {
+			watchlistGroupID = watchlistGroupIDFromList(body)
+		}
+		break
+	}
 
 	sem := make(chan struct{}, maxConcurrentProbes)
 	var wg sync.WaitGroup
 	for i, p := range probes {
+		if i == accountListIndex || i == watchlistGroupsIndex {
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int, p Probe) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			results[i] = runOne(ctx, sess, p)
+			if p.AccountScoped && accountKey == "" {
+				results[i] = Result{Probe: p, Detail: "account-list did not return a primary account key"}
+				return
+			}
+			if p.WatchlistGroupScoped {
+				if watchlistGroupID == 0 {
+					results[i] = Result{Probe: p, Skipped: true, Detail: "not applicable: account has no watchlist folders"}
+					return
+				}
+				p.URL = strings.ReplaceAll(p.URL, "{watchlistGroupId}", strconv.FormatInt(watchlistGroupID, 10))
+				baseCheck := p.Check
+				p.Check = func(status int, body []byte) error {
+					if err := baseCheck(status, body); err != nil {
+						return err
+					}
+					if !watchlistGroupResponseContains(body, watchlistGroupID) {
+						return fmt.Errorf("result.watchlists does not contain requested folder %d", watchlistGroupID)
+					}
+					return nil
+				}
+			}
+			results[i] = runOne(ctx, sess, p, accountKey)
 		}(i, p)
 	}
 	wg.Wait()
 	return results
 }
 
-func runOne(ctx context.Context, sess *session.Session, p Probe) Result {
+func watchlistGroupResponseContains(body []byte, wanted int64) bool {
+	var envelope struct {
+		Result struct {
+			Watchlists []struct {
+				ID int64 `json:"id"`
+			} `json:"watchlists"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	for _, group := range envelope.Result.Watchlists {
+		if group.ID == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func watchlistGroupIDFromList(body []byte) int64 {
+	var envelope struct {
+		Result struct {
+			Watchlists []struct {
+				ID int64 `json:"id"`
+			} `json:"watchlists"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(body, &envelope) != nil || len(envelope.Result.Watchlists) == 0 {
+		return 0
+	}
+	return envelope.Result.Watchlists[0].ID
+}
+
+func runOne(ctx context.Context, sess *session.Session, p Probe, accountKey string) Result {
+	result, _ := executeProbe(ctx, sess, p, accountKey)
+	return result
+}
+
+func executeProbe(ctx context.Context, sess *session.Session, p Probe, accountKey string) (Result, []byte) {
 	res := Result{Probe: p}
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -158,7 +247,7 @@ func runOne(ctx context.Context, sess *session.Session, p Probe) Result {
 	req, err := http.NewRequestWithContext(reqCtx, p.Method, p.URL, bodyReader)
 	if err != nil {
 		res.Detail = "build request: " + err.Error()
-		return res
+		return res, nil
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", tossclient.DefaultBrowserUserAgent)
@@ -175,23 +264,47 @@ func runOne(ctx context.Context, sess *session.Session, p Probe) Result {
 			req.Header.Set(k, v)
 		}
 	}
+	if p.AccountScoped && accountKey != "" {
+		req.Header.Set("accountKey", accountKey)
+	}
 
 	start := time.Now()
 	resp, err := (&http.Client{}).Do(req)
 	res.Duration = time.Since(start)
 	if err != nil {
 		res.Detail = "transport: " + err.Error()
-		return res
+		return res, nil
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	res.Status = resp.StatusCode
 	if checkErr := p.Check(resp.StatusCode, body); checkErr != nil {
 		res.Detail = checkErr.Error()
-		return res
+		return res, body
 	}
 	res.OK = true
-	return res
+	return res, body
+}
+
+func accountKeyFromList(body []byte) string {
+	var envelope struct {
+		Result struct {
+			PrimaryKey  string `json:"primaryKey"`
+			AccountList []struct {
+				Key string `json:"key"`
+			} `json:"accountList"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return ""
+	}
+	if key := strings.TrimSpace(envelope.Result.PrimaryKey); key != "" {
+		return key
+	}
+	if len(envelope.Result.AccountList) > 0 {
+		return strings.TrimSpace(envelope.Result.AccountList[0].Key)
+	}
+	return ""
 }
 
 // expectStatus / expectPath moved to internal/ops (probe specs live next to

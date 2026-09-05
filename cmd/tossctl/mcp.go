@@ -9,19 +9,25 @@ import (
 
 	tossclient "github.com/JungHoonGhae/tossinvest-cli/internal/client"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/config"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/hiddenholding"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/hybrid"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/mcp"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/official"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/openapiip"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/orderlineage"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/papertrading"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/pricealert"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/routing"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/session"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/trading"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/updatecheck"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/version"
+	watchlistservice "github.com/JungHoonGhae/tossinvest-cli/internal/watchlist"
 	"github.com/spf13/cobra"
 )
 
-func mcpOfficialBackends(cfg config.File, creds *official.Credentials, tokenFile, lineageFile, prefer string) (*official.Client, *trading.Service) {
-	if creds == nil || !cfg.OpenAPI.Enabled || prefer == "wts" {
+func mcpOfficialBackends(cfg config.File, creds *official.Credentials, tokenFile, lineageFile string, prefer routing.Preference) (*official.Client, *trading.Service) {
+	if creds == nil || !cfg.OpenAPI.Enabled || prefer == routing.WTS {
 		return nil, nil
 	}
 	officialClient := official.New(*creds, tokenFile)
@@ -31,7 +37,7 @@ func mcpOfficialBackends(cfg config.File, creds *official.Credentials, tokenFile
 }
 
 // newMCPCmd builds the `tossctl mcp` command: a stdio Model Context Protocol
-// server exposing the official Toss Open API through a catalog tool surface
+// server exposing official, WTS, and enabled experimental operations through a catalog tool surface
 // (list_operations / describe_operation / call_operation).
 //
 // It speaks JSON-RPC 2.0 over stdin/stdout and is meant to be launched by an
@@ -45,8 +51,11 @@ func newMCPCmd(opts *rootOptions) *cobra.Command {
 			"command `tossctl mcp`. It covers the official Open API (reads plus gated " +
 			"order place/cancel/modify) and, when a web session is present, the WTS-only " +
 			"reads (rankings, flows, AI signals, screener, sectors, earnings, briefing, " +
-			"community, dividends, Prime, transactions). Order mutations follow the same " +
-			"config gate and execute/confirm flow as `tossctl order` and use the official " +
+			"community, dividends, Prime, transactions), plus safely gated account-setting " +
+			"writes. Opted-in paper-trading operations are labeled experimental and target " +
+			"only the isolated paper environment. Every write publishes its risk, reversibility, " +
+			"approval, and verification policy. Live order mutations follow the same config " +
+			"gate and execute/confirm flow as `tossctl order` and use the official " +
 			"API only (no WTS). Needs at least one credential: `tossctl openapi login` " +
 			"(official) and/or `tossctl auth login` (WTS web session).",
 		Annotations:  map[string]string{"source": "both"},
@@ -105,8 +114,23 @@ func newMCPCmd(opts *rootOptions) *cobra.Command {
 			}
 			routed := hybrid.New(routedWTS, officialClient,
 				hybrid.Policy{Prefer: prefer, Fallback: cfg.OpenAPI.Fallback}, os.Stderr)
+			if tradingSvc != nil {
+				tradingSvc.WithConditionalBroker(routed)
+			}
 
-			server := mcp.NewServer(officialClient, routed, tradingSvc, "tossinvest-cli", version.Current().Version)
+			var ipManager *openapiip.Service
+			if sess != nil {
+				ipManager = openapiip.NewService(routed, openapiip.NewHTTPResolver(nil, ""))
+			}
+			server := mcp.NewServer(officialClient, routed, mcp.Services{
+				Trading:        tradingSvc,
+				OpenAPIIP:      ipManager,
+				PriceAlerts:    pricealert.NewService(routed),
+				HiddenHoldings: hiddenholding.NewService(routed),
+				Watchlists:     watchlistservice.NewService(routed),
+				Paper:          papertrading.NewService(routed),
+				Experiments:    enabledExperiments(cfg),
+			}, "tossinvest-cli", version.Current().Version)
 
 			// Read-only auth snapshot for the auth_status operation (no secrets —
 			// only connected flags + expiry timestamps).
@@ -122,7 +146,7 @@ func newMCPCmd(opts *rootOptions) *cobra.Command {
 				cur := version.Current().Version
 				if updatecheck.IsNewer(latest, cur) {
 					server.AppendInstructions(fmt.Sprintf(
-						"Update available: tossctl v%s (this server runs v%s). Tell the user they can update with `brew upgrade tossctl-cli` or `tossctl update`, then restart this MCP server to pick it up.",
+						"Update available: tossctl v%s (this server runs v%s). Tell the user they can update with `brew upgrade tossctl` or `tossctl update`, then restart this MCP server to pick it up.",
 						latest, cur))
 				}
 			}

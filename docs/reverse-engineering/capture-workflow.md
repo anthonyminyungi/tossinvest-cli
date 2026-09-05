@@ -13,6 +13,22 @@ Capture Toss Securities web traffic in a way that is:
 
 This workflow is for reverse engineering the web product, not for bypassing login or automating trading.
 
+## Evidence Levels (implementation gate)
+
+경로 문자열이 보인다는 사실만으로는 기능 계약이 아니다. 각 후보는 다음 중 하나로
+기록하며, **구현은 `verified`만 허용**한다.
+
+| Level | Required evidence | Action |
+| --- | --- | --- |
+| `verified` | method + host + path + query/body + response model, and a read-only live schema check or sanitized capture | 구현·probe 가능 |
+| `partial` | 정적 인터페이스는 정확하지만 host/auth 또는 live response 중 하나가 없음 | 문서화만, 구현 금지 |
+| `inferred` | 문자열·라우트·이름·인접 코드에서 추론 | 후보로만 유지 |
+| `unknown` | 의미나 mutation 여부까지 불명확 | 호출 금지 |
+
+응답 필드 의미를 이름으로 번역하거나 빈 본문·세 호스트 순회로 우연히 받은 200을
+`verified`로 올리지 않는다. 쓰기는 여기에 더해 되돌릴 수 있는지, 별도 동의가 필요한지,
+preview/confirm이 가능한지까지 확인해야 한다.
+
 ## Scope
 
 Priority screens for Milestone 1:
@@ -199,9 +215,23 @@ session.json cookies → [{name,value,domain:'.tossinvest.com',path:'/',
 404 난다.** 정확한 경로·메서드는 프로덕션 번들에서 뽑는다:
 
 ```
-GET / → buildId 추출 → _buildManifest.js → 청크 URL 수집 → 전부 fetch 후 concat
+GET / + 번들에서 발견한 라우트 HTML → 활성 buildId 집합 추출
+→ 각 build의 _buildManifest.js + 라우트 청크 URL 합집합 → 새 build·chunk·route가
+더 나오지 않는 고정점까지 반복 → 전부 concat
 번들에서: path:"/api/vN/..." + 근처 method:"GET|POST" 정규식으로 정확한 정의 추출
 ```
+
+WTS rolling deploy 중에는 `/`와 개별 라우트가 서로 다른 buildId를 줄 수
+있다. 하나만 고르지 않고 활성 build 전체의 manifest와 청크를 합쳐야 부분 배포가
+대량 endpoint 삭제로 오인되지 않는다. 생성 결과의 `build_ids`는 그 집합이고,
+`build_id`는 구버전 소비자가 manifest URL에 계속 사용할 수 있도록 `/` HTML에서 관측한
+단일 root build를 유지한다. 변화 감지와 부분 수집 판정은 `build_ids` 집합을 기준으로 하며,
+옛 catalog에 이 필드가 없을 때만 `build_id`를 fallback으로 사용한다.
+비정상 번들이 무제한 crawler로 번지는 것을 막기 위해 build 8개·chunk 1,000개·route
+2,000개, 응답당 16 MiB·전체 256 MiB의 넉넉한 상한을 두며, 초과하면 카탈로그를
+덮어쓰지 않고 실패한다. redirect 최종 origin도 `www.tossinvest.com`으로 제한한다. root,
+manifest, chunk의 404와 모든 일시적 fetch 실패는 전체 수집 실패다. 번들 정규식으로 추측한
+UI route의 확정 404만 “화면 없음”으로 건너뛰며 timeout·5xx·빈 응답은 부분 수집으로 거절한다.
 
 주의: minified 변수명(eP, o, c…)은 청크마다 재사용돼 **호출부(요청 바디) 정적 추적은
 신뢰도 낮다.** 경로·메서드까지만 번들로 얻고, 바디는 라이브로 확인.
@@ -228,18 +258,19 @@ profit 계열처럼 POST 이고 파라미터가 필요하면:
 4. 안 되면 **실제 웹 요청 바디를 잡는다** — `node tools/capture_post_bodies.mjs <경로>`.
    아래 "첫 로드 POST 바디 캡처" 참고. (예전엔 여기가 막혀 있었다.)
 
-### 4. 웹 UI 유무 판정 = "모바일 전용" 분류의 유일한 기준
+### 4. 웹 UI 유무와 API 접근 경로를 따로 판정
 
-**카탈로그 candidate ≠ 모바일 전용.** 반드시 라이브로 웹 라우트를 열어 판정:
+**카탈로그 candidate ≠ mobile API.** 반드시 라이브로 웹 라우트를 열어 UI 존재 여부를 판정:
 
 ```
 $B goto /account/<feature> → 리다이렉트 없이 실제 화면이 뜨고 관련 텍스트가 보이면
-→ 웹 UI 있음 (일반 조회) / 뜨면 안 뜨거나 signin 리다이렉트면 → 웹 UI 없음 (모바일 전용)
+→ 웹 UI 있음 / 뜨지 않거나 signin 리다이렉트면 → 웹 UI 없음
 ```
 
-실측: accumulate=웹UI 없음(진짜 모바일 전용), profit·transfer-income=웹UI 있음.
-README 의 "📱 모바일 앱 전용" 서브섹션엔 **웹UI 없는 것만.** 토스가 UI 추가하면 일반
-표로 옮긴다 (판정을 주간 모니터가 추적하도록 하는 게 이상적 — TODO).
+실측: accumulate=웹UI 없음, profit·transfer-income=웹UI 있음. 다만 웹 UI가 없다는 사실은
+그 API가 mobile 인증이라는 뜻이 아니다. accumulate처럼 증권 모바일 화면에서 발견했어도
+WTS 세션으로 호출 검증된 계약은 `domain=securities, source=wts`다. 일반 Toss
+Banking/MyData의 `source=mobile` 계약은 별도 client/interceptor·토큰·동의를 확인해야 한다.
 
 ### 5. 구현 = 기존 RE 흐름 그대로
 
@@ -435,6 +466,9 @@ POST /api/v2/screener/screen                              (구현됨)
 - **안드로이드 앱 트래픽 캡처**: 갤럭시(루팅X)에 mitmproxy 인증서까지 설치 성공해도,
   **토스 앱은 인증서 핀닝**으로 통신 거부 (삼성 인터넷은 됨 = 프록시는 정상, 앱만 막힘).
   루팅 없이는 APK 재패키징이 유일한데 Play Integrity 로 로그인 거부됨. **불가.**
+- **Android 정적 분석은 가능**: 위 항목은 동적 MITM 캡처가 막힌다는 뜻이다. 서명된
+  APK의 Retrofit 인터페이스·serializer·repository 호출부를 함께 읽어 method/path/body/
+  response를 확인하는 정적 분석은 별도 경로로 사용한다. 아래 절차를 따른다.
 - **iOS 앱 캡처**: 인증서 신뢰가 안드로이드보다 쉽고 핀닝도 앱마다 달라 **성공 가능성
   있음** — 필요하면 iOS 기기로 시도.
 - ~~**`/browse` addInitScript 로 SPA 첫 요청 바디 잡기**~~ / ~~**React Query 캐시**~~
@@ -498,10 +532,45 @@ node tools/capture_post_bodies.mjs /feed/news --get            # GET 도 (조회
 3. `Network.requestWillBeSent` 에서 non-GET `/api/` 요청의 `postData` 수집
 4. 종료 시 브라우저·임시 프로필 정리
 
-**아무것도 안 잡히면**: 세션 만료(가장 흔함), 해당 라우트에 웹 UI 가 없음(= 모바일 전용),
-또는 화면이 느려서 `--wait` 을 늘려야 하는 경우다.
+**아무것도 안 잡히면**: 세션 만료(가장 흔함), 해당 라우트에 웹 UI가 없거나, 화면이 느려서
+`--wait`을 늘려야 하는 경우다. 웹 UI 부재만으로 모바일 전용이라 판정하지 않는다. WTS bundle에
+계약이 있고 현재 세션으로 검증되면 UI 없이도 `source=wts`이며, APK client binding의
+host·인증·interceptor까지 추적된 경우에만 `source=mobile` 후보로 분류한다.
 
 전제: Node 18+ (내장 `WebSocket` 사용, npm 설치 불필요) 와 Playwright 브라우저 캐시.
+
+## Android APK 정적 분석 (2026-09-02 정립)
+
+동적 캡처 대신 모바일 전용 계약의 **후보와 정확한 자료형**을 찾는 절차다. APK에서
+보였다는 이유만으로 현재 WTS 세션으로 호출 가능한 것은 아니다.
+
+1. Play package id와 버전을 기록한다 (`viva.republica.toss`, 분석본 5.275.0).
+2. APK/XAPK의 SHA-256과 서명 인증서 SHA-256을 기록하고 알려진 Toss 배포본과 대조한다.
+   `apksigtool verify`에서 v2/v3가 모두 검증돼야 한다. 검증 실패 산출물은 분석하지 않는다.
+3. JADX에서 Retrofit annotation을 찾아 method/path/header/query/body를 기록한다.
+4. request serializer에서 **wire field 이름과 기본값**, response serializer에서 필수 필드와
+   자료형을 확인한다. UI 문자열이나 클래스명만으로 필드 의미를 만들지 않는다.
+5. repository/use-case 호출부에서 wrapper 해제 순서와 실제 선택하는 section/item을 확인한다.
+6. 네트워크 module의 base-client binding과 interceptor chain을 찾는다. host, request
+   cipher, session header 중 하나라도 풀리지 않으면 `partial`이다. 기존 마스킹 캡처나
+   read-only live probe로 전체 request envelope가 확인돼야 `verified`다.
+7. WTS와 Toss Home/MyData client를 분리한다. `.tossinvest.com` 세션을 다른 host에 보내
+   인증 가능성을 시험하지 않는다.
+8. 라이브 검증은 읽기 전용으로 한 번만 하고 값 대신 key/type/count/masking 불변식만 본다.
+   테스트와 문서에는 합성 데이터만 둔다.
+
+### 쓰기 계약 추가 조건
+
+- 금융 mutation은 정적 분석만으로 구현하지 않는다. 기존 주문처럼 preview → config opt-in
+  → `--execute` → confirm token을 모두 설계할 수 있어야 한다.
+- 관심종목처럼 비금융·되돌림 가능한 mutation도 method/body/XSRF와 실제 UI 동작을 모두
+  캡처한 뒤 구현한다.
+- MyData 동의, 오픈뱅킹 활성화, 계좌 저장/삭제, 송금 계열은 별도 모바일 인증·동의 경계다.
+  현재 WTS connector에 섞지 않으며 정적 인벤토리에만 남긴다.
+- 실제 쓰기 검증은 이 워크플로우가 자동 수행하지 않는다. 매 호출마다 사람이 승인한다.
+
+첫 적용 결과는 [2026-09-02 Android 정적 분석](change-analysis/2026-09-02-android-static.md)에
+기록했다.
 
 ## 번들 삼중 정의가 경로·호스트의 진실이다 (2026-08-24)
 

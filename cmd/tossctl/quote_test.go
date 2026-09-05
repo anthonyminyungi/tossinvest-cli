@@ -2,8 +2,42 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestQuoteMetadataCommandContract(t *testing.T) {
+	quote := newQuoteCmd(&rootOptions{})
+	cmd, _, err := quote.Find([]string{"metadata"})
+	if err != nil || cmd == quote || cmd.Name() != "metadata" {
+		t.Fatalf("metadata command not registered: cmd=%q err=%v", cmd.Name(), err)
+	}
+	if cmd.Annotations["source"] != "official" {
+		t.Fatalf("source = %q, want official", cmd.Annotations["source"])
+	}
+	if !strings.Contains(cmd.Use, "<symbol>") {
+		t.Fatalf("Use = %q, want symbol contract", cmd.Use)
+	}
+	if err := cmd.Args(cmd, nil); err == nil {
+		t.Fatal("metadata must reject an empty symbol list")
+	}
+	if err := cmd.Args(cmd, []string{"AAPL,005930"}); err != nil {
+		t.Fatalf("metadata rejected valid symbols: %v", err)
+	}
+}
+
+func TestQuoteAlertCommandContract(t *testing.T) {
+	quote := newQuoteCmd(&rootOptions{})
+	for _, path := range [][]string{{"alert", "list"}, {"alert", "add"}, {"alert", "remove"}} {
+		cmd, _, err := quote.Find(path)
+		if err != nil || cmd == quote || cmd.Name() != path[len(path)-1] {
+			t.Fatalf("%v command not registered: cmd=%q err=%v", path, cmd.Name(), err)
+		}
+		if cmd.Annotations["source"] != "wts" || cmd.Annotations["domain"] != "securities" {
+			t.Fatalf("%v annotations = %#v", path, cmd.Annotations)
+		}
+	}
+}
 
 func TestParseBatchSymbols(t *testing.T) {
 	cases := []struct {

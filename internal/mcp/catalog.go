@@ -28,9 +28,10 @@ type (
 	BackendStatus  = ops.BackendStatus
 	Param          = ops.Param
 	Operation      = ops.Operation
+	MutationPolicy = ops.MutationPolicy
 	Catalog        = ops.Catalog
 	OfficialBroker = ops.OfficialBroker
 )
 
 // NewCatalog builds the shared operation catalog.
-func NewCatalog() *Catalog { return ops.NewCatalog() }
+func NewCatalog(enabledExperiments ...string) *Catalog { return ops.NewCatalog(enabledExperiments...) }

@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -97,11 +98,54 @@ class TestDerivePaths(unittest.TestCase):
 
 
 class TestClassify(unittest.TestCase):
+    def test_capture_sweep_preserves_existing_source_evidence(self):
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        with open(
+            os.path.join(repo, "docs", "reverse-engineering", "wts-endpoints.json"),
+            encoding="utf-8",
+        ) as source:
+            catalog = json.load(source)
+        self.assertIn(
+            "bundle-literal:",
+            catalog["endpoints"]["/api/v1/bond-infos"]["observed"]["source"],
+            "the generated catalog must retain hand-audited bundle-call evidence",
+        )
+
     def test_override_beats_everything(self):
         ov = {"/api/v1/account/list": {"status": "candidate", "note": "손으로 뒤집음"}}
         status, note = W.classify("/api/v1/account/list", ov)
         self.assertEqual(status, "candidate")
         self.assertEqual(note, "손으로 뒤집음")
+
+    def test_verified_override_metadata_survives_regeneration(self):
+        entry = {"status": "implemented"}
+        override = {
+            "status": "implemented",
+            "method": "DELETE,POST",
+            "host": "wts-api",
+            "evidence": "verified",
+        }
+
+        W.apply_override_metadata(entry, override)
+
+        self.assertEqual(entry["method"], "DELETE,POST")
+        self.assertEqual(entry["host"], "wts-api")
+        self.assertEqual(entry["evidence"], "verified")
+
+    def test_bundle_metadata_wins_over_curated_override_metadata(self):
+        entry = {"status": "implemented", "method": "GET", "host": "wts-info-api"}
+        override = {
+            "status": "implemented",
+            "method": "DELETE,POST",
+            "host": "wts-api",
+            "evidence": "verified",
+        }
+
+        W.apply_override_metadata(entry, override)
+
+        self.assertEqual(entry["method"], "GET")
+        self.assertEqual(entry["host"], "wts-info-api")
+        self.assertEqual(entry["evidence"], "verified")
 
     def test_live_concrete_parent_override_does_not_leak_into_templated_child(self):
         parent = "/api/v3/stock-prices"
@@ -114,6 +158,509 @@ class TestClassify(unittest.TestCase):
         # account/list 는 IMPLEMENTED 이고 account 계열 일부는 EXCLUDED 다.
         status, _ = W.classify("/api/v1/account/list", {})
         self.assertEqual(status, "implemented")
+
+    def test_preference_endpoints_are_implemented(self):
+        for path in [
+            "/api/v1/user-price-alimy/{stockCode}",
+            "/api/v1/user-price-alimy/{stockCode}/{currency}/{targetPrice}",
+            "/api/v1/my-assets/hidden-stocks/hide",
+            "/api/v1/my-assets/hidden-stocks/show",
+            "/api/v2/hidden-stocks",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "implemented")
+
+    def test_watchlist_implementation_does_not_claim_unimplemented_sibling_writes(self):
+        for path in [
+            "/api/v1/new-watchlists",
+            "/api/v1/new-watchlists/groups",
+            "/api/v1/new-watchlists/groups/simple",
+            "/api/v1/new-watchlists/groups/{id}",
+            "/api/v1/new-watchlists/items",
+            "/api/v1/new-watchlists/items/remove",
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(W.classify(path, {})[0], "implemented")
+
+        for path in [
+            "/api/v1/new-watchlists/groups/reorder",
+            "/api/v1/new-watchlists/items/move-groups",
+            "/api/v1/new-watchlists/items/reorder",
+            "/api/v1/new-watchlists/recent/add",
+            "/api/v1/new-watchlists/recent/delete",
+            "/api/v1/new-watchlists/recent/delete-all",
+        ]:
+            with self.subTest(path=path):
+                self.assertNotEqual(W.classify(path, {})[0], "implemented")
+
+    def test_portfolio_folder_mutations_are_curated_but_deferred(self):
+        expected = {
+            "/api/v2/share-holdings/folders": ("POST", "reversible"),
+            "/api/v2/share-holdings/folders/{folderKey}": ("DELETE", "irreversible"),
+            "/api/v2/share-holdings/folders/name/{folderKey}": ("PUT", "reversible"),
+            "/api/v2/share-holdings/folders/move": ("PUT", "reversible"),
+            "/api/v2/share-holdings/folders/items": ("PUT", "reversible"),
+            "/api/v2/share-holdings/folders/validate-name": ("POST", "not-applicable"),
+        }
+        for path, (method, reversibility) in expected.items():
+            with self.subTest(path=path):
+                contract = W.CURATED_CONTRACTS[path]
+                self.assertEqual(contract["method"], method)
+                self.assertEqual(contract["host"], "wts-cert-api")
+                self.assertEqual(contract["evidence"], "partial")
+                self.assertEqual(contract["priority"], "deferred")
+                self.assertEqual(contract["mutation"]["reversibility"], reversibility)
+
+    def test_paper_contracts_distinguish_verified_implementation_from_rollout_readiness(self):
+        verified = {
+            "/api/v1/paper/cash-balance",
+            "/api/v1/paper/deposit",
+            "/api/v1/paper/education/summary",
+            "/api/v1/paper/trading/orders/histories/all/pending",
+            "/api/v2/paper/trading/my-orders/markets/us-opt/by-date/completed",
+            "/api/v2/paper/trading/order/prepare",
+            "/api/v2/paper/trading/order/create",
+            "/api/v2/paper/trading/order/cancel/prepare/{date}/{orderNo}",
+            "/api/v3/paper/trading/order/cancel/{date}/{orderNo}",
+            "/api/v3/paper/trading/order/bulk-cancel/prepare",
+            "/api/v3/paper/trading/order/bulk-cancel",
+        }
+        for path in verified:
+            with self.subTest(path=path):
+                contract = W.CURATED_CONTRACTS[path]
+                self.assertEqual(contract["host"], "wts-cert-api")
+                self.assertEqual(contract["evidence"], "verified")
+                self.assertNotIn("priority", contract)
+                self.assertEqual(W.classify(path, {})[0], "implemented")
+
+        for path in [
+            "/api/v1/paper/deposit",
+            "/api/v2/paper/trading/order/create",
+            "/api/v3/paper/trading/order/cancel/{date}/{orderNo}",
+            "/api/v3/paper/trading/order/bulk-cancel",
+        ]:
+            self.assertEqual(
+                W.CURATED_CONTRACTS[path]["mutation"]["approval"],
+                "simulation-execute",
+            )
+
+        init = W.CURATED_CONTRACTS["/api/v1/paper/init"]
+        self.assertEqual(init["evidence"], "partial")
+        self.assertEqual(init["priority"], "deferred")
+        self.assertIn("opaque 500", init["note"])
+        self.assertEqual(W.classify("/api/v1/paper/init", {})[0], "implemented")
+
+        education = W.CURATED_CONTRACTS["/api/v1/paper/education/session/{action}"]
+        self.assertEqual(education["priority"], "deferred")
+        self.assertEqual(education["mutation"]["approval"], "human-only")
+        self.assertNotEqual(
+            W.classify("/api/v1/paper/education/session/{action}", {})[0],
+            "implemented",
+        )
+
+    def test_account_services_batch_endpoints_are_implemented(self):
+        for path in [
+            "/api/v1/autotrade/open-banking/creatable",
+            "/api/v1/autotrade/open-banking/need-registration",
+            "/api/v1/trading/settings/simple-trade",
+            "/api/v2/trading/settings/investor-exchange-choice-type",
+            "/api/v1/users/settings/me/ats-notification",
+            "/api/v1/member-subscriptions/get-option-real-time-tick",
+            "/api/v1/securities-transfer/my-accounts",
+            "/api/v1/securities-transfer/recent-accounts",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "implemented")
+
+    def test_account_access_and_banking_link_endpoints_are_implemented(self):
+        for path in [
+            "/api/v1/user/last-login-info",
+            "/api/v1/margin/cert/frozen-account",
+            "/api/v2/account/unlock/accident-account/count",
+            "/api/v1/trading/open-banking/auto-trading",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "implemented")
+
+    def test_unstable_trade_purpose_mydata_read_is_deferred(self):
+        path = "/api/v1/trade-purpose-verification/my-data/account/exists"
+        status, _ = W.classify(path, {})
+        self.assertEqual(status, "candidate")
+        self.assertEqual(W.CURATED_CONTRACTS[path]["priority"], "deferred")
+
+    def test_notification_status_keeps_unique_reads_and_excludes_duplicates(self):
+        for path in [
+            "/api/v1/user-alimies",
+            "/api/v1/inbox-alimies/has-unread",
+            "/api/v1/reasoning/agreement",
+            "/api/v1/reasoning-news/count",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "implemented")
+
+        for path in [
+            "/api/v1/ai-issue/sns-release/alimy",
+            "/api/v1/fomc-live/alimy",
+            "/api/v1/reasoning-contents/alimy/subscription",
+            "/api/v2/dashboard/intelligences/all",
+        ]:
+            with self.subTest(path=path):
+                status, note = W.classify(path, {})
+                self.assertEqual(status, "excluded")
+                self.assertTrue(note)
+
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        with open(
+            os.path.join(repo, "docs", "reverse-engineering", "wts-endpoints.json"),
+            encoding="utf-8",
+        ) as source:
+            catalog = json.load(source)
+        agreement = catalog["overrides"]["/api/v1/reasoning/agreement"]
+        self.assertEqual(agreement["method"], "GET")
+        self.assertIn("POST mutation remains deferred", agreement["note"])
+        endpoint = catalog["endpoints"]["/api/v1/reasoning/agreement"]
+        self.assertEqual(endpoint["method"], "GET,POST")
+        self.assertEqual(endpoint["implemented_methods"], ["GET"])
+        self.assertEqual(endpoint["deferred_methods"], ["POST"])
+
+    def test_asset_snapshot_contracts_are_implemented_without_claiming_truncated_paths(self):
+        for path in [
+            "/api/v1/asset-snapshot/all-accounts/chart/{range}/{stepUnit}",
+            "/api/v1/asset-snapshot/all-accounts/chart/ONE_MONTH/DAY",
+            "/api/v1/asset-snapshot/all-accounts/detail-by-date",
+            "/api/v1/asset-snapshot/all-accounts/page",
+            "/api/v1/asset-snapshot/chart/{range}/{stepUnit}",
+            "/api/v1/asset-snapshot/chart/ONE_MONTH/DAY",
+            "/api/v1/asset-snapshot/detail-by-date",
+            "/api/v1/asset-snapshot/page",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "implemented")
+
+        for truncated in [
+            "/api/v1/asset-snapshot/all-accounts/chart",
+            "/api/v1/asset-snapshot/chart",
+        ]:
+            with self.subTest(path=truncated):
+                status, _ = W.classify(truncated, {})
+                self.assertNotEqual(status, "implemented")
+
+    def test_asset_snapshot_probe_normalizes_to_bundle_template(self):
+        for path in [
+            "/api/v1/asset-snapshot/all-accounts/chart/ONE_MONTH/DAY",
+            "/api/v1/asset-snapshot/chart/ONE_MONTH/DAY",
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    W._probe_inventory_path(path),
+                    path.removesuffix("/ONE_MONTH/DAY") + "/{range}/{stepUnit}",
+                )
+
+    def test_ai_signal_detail_and_sector_simple_are_implemented(self):
+        for path in [
+            "/api/v1/dashboard/wts/overview/ai-signals/detail",
+            "/api/v2/dashboard/wts/overview/tics/{id}/simple",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "implemented")
+
+    def test_index_session_metadata_is_implemented(self):
+        status, _ = W.classify("/api/v2/index-infos/{code}", {})
+        self.assertEqual(status, "implemented")
+
+    def test_recommendation_preserves_verified_note(self):
+        priority, note = W.recommendation(
+            "/api/v1/earning-call/user-based",
+            "candidate",
+            "verified blocker",
+            {},
+        )
+        self.assertEqual(priority, "next")
+        self.assertEqual(note, "verified blocker")
+
+    def test_recommendation_can_be_explicitly_deferred(self):
+        priority, note = W.recommendation(
+            "/api/v1/r-chart",
+            "candidate",
+            "no current consumer",
+            {"priority": "deferred"},
+        )
+        self.assertEqual(priority, "deferred")
+        self.assertEqual(note, "no current consumer")
+
+    def test_dynamic_price_alert_delete_contract_is_curated(self):
+        path = "/api/v1/user-price-alimy/{stockCode}/{currency}/{targetPrice}"
+        self.assertEqual(W.CURATED_CONTRACTS[path]["method"], "DELETE")
+        self.assertEqual(W.CURATED_CONTRACTS[path]["host"], "wts-api")
+
+    def test_price_alert_probe_normalizes_to_catalog_template(self):
+        self.assertEqual(
+            W._probe_inventory_path("/api/v1/user-price-alimy/A005930"),
+            "/api/v1/user-price-alimy/{stockCode}",
+        )
+
+    def test_sector_probe_normalizes_small_numeric_id_to_catalog_template(self):
+        self.assertEqual(
+            W._probe_inventory_path(
+                "/api/v2/dashboard/wts/overview/tics/1/stocks"
+            ),
+            "/api/v2/dashboard/wts/overview/tics/{id}/stocks",
+        )
+
+    def test_earning_detail_probe_normalizes_to_bundle_template(self):
+        self.assertEqual(
+            W._probe_inventory_path(
+                "/api/v1/earning-call/events/228692/info"
+            ),
+            "/api/v1/earning-call/events/{eventId}/info",
+        )
+
+    def test_diff_reports_build_and_chunk_changes(self):
+        previous = {"build_id": "old", "build_ids": ["old", "rolling"], "chunk_count": 10}
+        current = {
+            "build_id": "new",
+            "build_ids": ["new", "rolling"],
+            "chunk_count": 11,
+            "endpoints": {"/api/v1/new": {"status": "candidate"}},
+        }
+        diff = W.build_diff(previous, current, ["/api/v1/new"], [])
+        self.assertTrue(diff["build_changed"])
+        self.assertTrue(diff["chunk_count_changed"])
+        self.assertEqual(diff["previous_build_id"], "old")
+        self.assertEqual(diff["current_build_id"], "new")
+        self.assertEqual(diff["previous_build_ids"], ["old", "rolling"])
+        self.assertEqual(diff["current_build_ids"], ["new", "rolling"])
+        self.assertEqual(diff["new_candidates"], ["/api/v1/new"])
+
+    def test_rolling_feature_snapshot_tracks_flags_routes_and_preserves_live_evidence(self):
+        previous = {
+            "paper-trading-us-options": {
+                "live_observations": {"order_create": {"status": 200}},
+                "implementation": {"cli": True},
+                "promotion_review": {"status": "blocked", "blockers": ["init-500"]},
+            }
+        }
+        paper = W.ROLLING_FEATURES["paper-trading-us-options"]
+        paths = set(paper["critical_endpoints"][:-1])
+        snapshot = W.rolling_feature_snapshot(
+            paths,
+            {"option.paper.wts.open": True},
+            ["build-b", "build-a"],
+            previous,
+            "2026-09-03",
+        )["paper-trading-us-options"]
+
+        self.assertEqual(snapshot["lifecycle"], "rolling_out")
+        self.assertTrue(snapshot["bundle_markers"]["option.paper.wts.open"])
+        self.assertFalse(snapshot["critical_surface_complete"])
+        self.assertEqual(snapshot["active_build_ids"], ["build-a", "build-b"])
+        self.assertEqual(snapshot["live_observations"]["order_create"]["status"], 200)
+        self.assertTrue(snapshot["implementation"]["cli"])
+        self.assertEqual(snapshot["promotion_criteria"]["target"], "stable")
+        self.assertEqual(snapshot["promotion_criteria"]["minimum_consecutive_builds"], 3)
+        self.assertEqual(snapshot["promotion_review"]["status"], "blocked")
+
+    def test_diff_reports_rolling_feature_contract_change(self):
+        previous = {"rolling_features": {"paper": {
+            "bundle_markers": {"flag": False},
+            "endpoint_presence": {"/paper": False},
+        }}}
+        current = {"endpoints": {}, "rolling_features": {"paper": {
+            "bundle_markers": {"flag": True},
+            "endpoint_presence": {"/paper": True},
+        }}}
+
+        diff = W.build_diff(previous, current, [], [])
+
+        self.assertTrue(diff["rolling_features_changed"])
+        self.assertEqual(diff["rolling_feature_changes"], ["paper"])
+
+    def test_root_build_rotation_does_not_change_same_active_build_set(self):
+        previous = {"build_id": "build-a", "build_ids": ["build-a", "build-b"]}
+        current = {"build_id": "build-b", "build_ids": ["build-b", "build-a"]}
+
+        diff = W.build_diff(previous, current, [], [])
+
+        self.assertFalse(diff["build_changed"])
+        self.assertEqual(diff["previous_build_id"], "build-a")
+        self.assertEqual(diff["current_build_id"], "build-b")
+
+    def test_mass_inventory_shrink_is_rejected(self):
+        self.assertTrue(W.suspicious_inventory_shrink(1112, 326))
+        self.assertFalse(W.suspicious_inventory_shrink(1112, 1000))
+        self.assertFalse(W.suspicious_inventory_shrink(0, 0))
+
+    def test_smaller_chunk_walk_is_rejected_for_same_build(self):
+        self.assertTrue(W.incomplete_unchanged_build("same", "same", 101, 77))
+        self.assertTrue(W.incomplete_unchanged_build(["a", "b"], ["b", "a"], 101, 77))
+        self.assertFalse(W.incomplete_unchanged_build("old", "new", 101, 77))
+        self.assertFalse(W.incomplete_unchanged_build("same", "same", 77, 101))
+
+    def test_fetch_retries_a_transient_failure(self):
+        response = mock.Mock()
+        response.geturl.return_value = W.BASE + "/asset.js"
+        response.read.side_effect = [b"ok", b""]
+        with mock.patch.object(
+            W.FETCH_OPENER,
+            "open",
+            side_effect=[OSError("transient"), response],
+        ) as opener:
+            self.assertEqual(W.fetch("/asset.js"), "ok")
+        self.assertEqual(opener.call_count, 2)
+        response.close.assert_called_once()
+
+    def test_fetch_rejects_oversized_or_cross_origin_assets(self):
+        oversized = mock.Mock()
+        oversized.geturl.return_value = W.BASE + "/asset.js"
+        oversized.read.return_value = b"x" * (W.DISCOVERY_MAX_RESPONSE_BYTES + 1)
+        with mock.patch.object(W.FETCH_OPENER, "open", return_value=oversized):
+            with self.assertRaisesRegex(RuntimeError, "byte limit"):
+                W.fetch("/asset.js")
+        oversized.close.assert_called_once()
+
+        for target in (
+            "http://www.tossinvest.com/asset.js",
+            "https://www.tossinvest.com:444/asset.js",
+            "https://example.invalid/asset.js",
+        ):
+            with self.subTest(target=target):
+                redirected = mock.Mock()
+                redirected.geturl.return_value = target
+                with mock.patch.object(W.FETCH_OPENER, "open", return_value=redirected):
+                    with self.assertRaisesRegex(RuntimeError, "redirected WTS asset"):
+                        W.fetch("/asset.js")
+                redirected.close.assert_called_once()
+
+    def test_redirect_handler_rejects_before_following_and_closes_response(self):
+        handler = W.SameOriginRedirectHandler()
+        request = W.urllib.request.Request(W.BASE + "/asset.js")
+        response = mock.Mock()
+        for target in (
+            "http://www.tossinvest.com/next.js",
+            "https://www.tossinvest.com:444/next.js",
+            "https://example.invalid/next.js",
+        ):
+            with self.subTest(target=target):
+                response.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, "outside"):
+                    handler.redirect_request(request, response, 302, "found", {}, target)
+                response.close.assert_called_once()
+
+    def test_fetch_closes_redirect_body_unread_and_follows_bounded_same_origin_hop(self):
+        redirected = mock.Mock()
+        redirected.getcode.return_value = 302
+        redirected.headers = {"Location": "/final.js"}
+        final = mock.Mock()
+        final.getcode.return_value = 200
+        final.geturl.return_value = W.BASE + "/final.js"
+        final.read.side_effect = [b"ok", b""]
+        with mock.patch.object(W.FETCH_OPENER, "open", side_effect=[redirected, final]) as opener:
+            self.assertEqual(W.fetch("/asset.js"), "ok")
+        self.assertEqual(opener.call_count, 2)
+        redirected.read.assert_not_called()
+        redirected.close.assert_called_once()
+        final.close.assert_called_once()
+
+    def test_guessed_route_distinguishes_not_found_from_transient_failure(self):
+        missing = W.urllib.error.HTTPError(
+            W.BASE + "/missing", 404, "not found", {}, None
+        )
+        with mock.patch.object(W.FETCH_OPENER, "open", side_effect=missing):
+            self.assertIsNone(W.fetch_route("/missing"))
+
+        with mock.patch.object(
+            W.FETCH_OPENER, "open", side_effect=OSError("transient")
+        ) as opener:
+            with self.assertRaisesRegex(W.WTSFetchError, "after 3 attempts"):
+                W.fetch_route("/sometimes")
+        self.assertEqual(opener.call_count, 3)
+
+    def test_total_discovery_byte_budget_fails_closed(self):
+        budget = W.DiscoveryByteBudget(1)
+        budget.reserve(1)
+        with self.assertRaisesRegex(RuntimeError, "byte budget exceeded"):
+            budget.reserve(1)
+        self.assertEqual(budget.used, 2, "downloaded-byte budget must be monotonic after failure")
+
+    def test_collect_paths_rejects_an_exhausted_chunk_fetch(self):
+        root_chunk = "/assets/v2/_next/static/chunks/root.js"
+        responses = {
+            "/": '{"buildId":"build-a"}<script src="' + root_chunk + '">',
+            "/assets/v2/_next/static/build-a/_buildManifest.js": '"chunks/root.js"',
+            root_chunk: "",
+        }
+
+        with mock.patch.object(W, "fetch", side_effect=lambda path, *_args, **_kwargs: responses.get(path, "")):
+            with self.assertRaisesRegex(RuntimeError, "required WTS assets.*root.js"):
+                W.collect_paths()
+
+    def test_collect_paths_rejects_root_without_build_identity(self):
+        with mock.patch.object(W, "fetch", return_value='<script src="/assets/v2/_next/static/chunks/root.js">'):
+            with self.assertRaisesRegex(RuntimeError, "missing buildId"):
+                W.collect_paths()
+
+    def test_build_identity_is_extracted_without_guessing(self):
+        self.assertEqual(W._html_build_id('{"buildId":"new-build"}'), "new-build")
+        self.assertEqual(W._html_build_id("<html></html>"), "")
+
+    def test_collect_paths_merges_rolling_builds_and_second_pass_routes(self):
+        root_chunk = "/assets/v2/_next/static/chunks/root.js"
+        account_chunk = "/assets/v2/_next/static/chunks/account-a.js"
+        calendar_chunk = "/assets/v2/_next/static/chunks/calendar-a.js"
+        third_chunk = "/assets/v2/_next/static/chunks/third-c.js"
+        base_a = "/assets/v2/_next/static/chunks/base-a.js"
+        base_b = "/assets/v2/_next/static/chunks/base-b.js"
+        base_c = "/assets/v2/_next/static/chunks/base-c.js"
+        responses = {
+            "/": '{"buildId":"build-b"}<script src="' + root_chunk + '">',
+            "/assets/v2/_next/static/build-b/_buildManifest.js": '"chunks/base-b.js"',
+            "/assets/v2/_next/static/build-a/_buildManifest.js": '"chunks/base-a.js"',
+            "/assets/v2/_next/static/build-c/_buildManifest.js": '"chunks/base-c.js"',
+            root_chunk: 'href:"/account"' + triple("info", "GET", "/api/v1/root"),
+            "/account": '{"buildId":"build-a"}<script src="' + account_chunk + '">',
+            account_chunk: triple("cert", "POST", "/api/v1/account-view"),
+            base_a: 'href:"/calendar"' + triple("info", "GET", "/api/v1/build-a"),
+            base_b: triple("info", "GET", "/api/v1/build-b"),
+            "/calendar": '{"buildId":"build-c"}<script src="' + calendar_chunk + '">',
+            calendar_chunk: triple("info", "GET", "/api/v1/calendar-view"),
+            base_c: 'href:"/third"' + triple("info", "GET", "/api/v1/build-c"),
+            "/third": '{"buildId":"build-c"}<script src="' + third_chunk + '">',
+            third_chunk: triple("info", "GET", "/api/v1/third-view"),
+        }
+        fetched = []
+
+        def fake_fetch(path, *_args, **_kwargs):
+            fetched.append(path)
+            return responses.get(path, "")
+
+        with mock.patch.object(W, "fetch", side_effect=fake_fetch):
+            build_id, build_ids, chunk_count, paths, _ = W.collect_paths()
+
+        self.assertEqual(build_id, "build-b")
+        self.assertEqual(build_ids, ["build-a", "build-b", "build-c"])
+        self.assertEqual(chunk_count, 7)
+        self.assertIn("/calendar", fetched, "second-pass route HTML was not fetched")
+        self.assertIn("/third", fetched, "fixed-point route HTML was not fetched")
+        for path in (
+            "/api/v1/root",
+            "/api/v1/account-view",
+            "/api/v1/build-a",
+            "/api/v1/build-b",
+            "/api/v1/calendar-view",
+            "/api/v1/build-c",
+            "/api/v1/third-view",
+        ):
+            self.assertIn(path, paths)
+
+    def test_discovery_budget_fails_closed_with_frontier_counts(self):
+        with self.assertRaisesRegex(RuntimeError, r"routes=2001>2000"):
+            W._check_discovery_budget(set(), set(), set(range(2001)))
 
     def test_kyc_is_excluded(self):
         status, reason = W.classify("/api/v1/kyc/status", {})
@@ -129,6 +676,28 @@ class TestClassify(unittest.TestCase):
         # 단수 account/ 만 걸러내고 있어 복수형 40여건이 새고 있었다.
         status, _ = W.classify("/api/v1/accounts/fatca", {})
         self.assertEqual(status, "excluded")
+
+    def test_sensitive_account_admin_and_auth_paths_are_excluded(self):
+        for path in [
+            "/api/v1/accounts/ssn-verification/check",
+            "/api/v1/accounts/ssn-verification/mark-ssn-verified",
+            "/api/v2/accounts/close/password",
+            "/api/v3/accounts/close",
+            "/api/v3/accounts/close/pre-check",
+            "/api/v1/session/refresh",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "excluded")
+
+    def test_legal_and_feedback_plumbing_is_excluded(self):
+        for path in [
+            "/api/v1/portal/agreement-modules/{moduleCode}",
+            "/api/v1/nova-feedback/user-feedbacks",
+        ]:
+            with self.subTest(path=path):
+                status, _ = W.classify(path, {})
+                self.assertEqual(status, "excluded")
 
     def test_unknown_path_is_candidate(self):
         status, _ = W.classify("/api/v1/brand-new-thing", {})
@@ -323,7 +892,7 @@ class TestClassify(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "internal/monitor"):
                 W.discover_go_exposures(repo)
 
-    def test_discover_go_probes_includes_hand_listed_monitor_probes(self):
+    def test_discover_go_probes_includes_shared_and_hand_listed_probes(self):
         repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         probes = W.discover_go_probes(repo)
         names = {probe["name"] for probe in probes}
@@ -348,6 +917,10 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(
             W._probe_inventory_path("/api/v2/stock-infos/A005930"),
             "/api/v2/stock-infos/{code}",
+        )
+        self.assertEqual(
+            W._probe_inventory_path("/api/v2/index-infos/KGG01P"),
+            "/api/v2/index-infos/{code}",
         )
         self.assertEqual(
             W._probe_inventory_path("/api/v4/calendar/monthly/2026-09"),

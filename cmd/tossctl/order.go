@@ -207,7 +207,7 @@ func newOrderPlaceCmd(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "place",
 		Short:       i18n.T("order.place.short"),
-		Annotations: map[string]string{"source": "both", "mutating": "true"},
+		Annotations: mutationAnnotations("both", "securities", "financial", "irreversible"),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app, err := newAppContext(opts)
 			if err != nil {
@@ -255,7 +255,7 @@ func newOrderCancelCmd(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "cancel",
 		Short:       i18n.T("order.cancel.short"),
-		Annotations: map[string]string{"source": "both", "mutating": "true"},
+		Annotations: mutationAnnotations("both", "securities", "financial", "irreversible"),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Early non-TTY guard — before expensive app context creation.
 			if orderID == "" && !tui.IsInteractive(os.Stdin, os.Stdout) {
@@ -321,7 +321,7 @@ func newOrderAmendCmd(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "amend",
 		Short:       i18n.T("order.amend.short"),
-		Annotations: map[string]string{"source": "both", "mutating": "true"},
+		Annotations: mutationAnnotations("both", "securities", "financial", "irreversible"),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Early non-TTY guard — before expensive app context creation.
 			if flags.orderID == "" && !tui.IsInteractive(os.Stdin, os.Stdout) {
@@ -444,7 +444,7 @@ func bindPlaceFlags(cmd *cobra.Command, flags *placeFlags) {
 
 func bindExecuteFlags(cmd *cobra.Command, flags *executeFlags) {
 	cmd.Flags().BoolVar(&flags.execute, "execute", false, "Perform the live mutation instead of a local preview")
-	cmd.Flags().StringVar(&flags.confirm, "confirm", "", "Confirmation token from `tossctl order preview`")
+	cmd.Flags().StringVar(&flags.confirm, "confirm", "", "Confirmation token from this command's preview output")
 
 	// Retired in v0.5.1: the live-mutation gate is now `--execute` + `--confirm <token>`.
 	// The old danger-acknowledgement flag is accepted (and ignored) for one release so
@@ -540,26 +540,25 @@ func newOrderConditionalCmd(opts *rootOptions) *cobra.Command {
 		Use:         "cancel <conditional-order-id>",
 		Short:       i18n.T("order.conditional.cancel.short"),
 		Args:        cobra.ExactArgs(1),
-		Annotations: map[string]string{"source": "official", "mutating": "true"},
+		Annotations: mutationAnnotations("official", "securities", "financial", "irreversible"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, err := newAppContext(opts)
 			if err != nil {
 				return err
 			}
-			intent := orderintent.ConditionalCancelIntent{ID: args[0]}
-			canonical := orderintent.CanonicalConditionalCancel(intent)
-			gateErr := conditionalGate(app.config, canonical, cancelExec, cancelConfirm)
-			if gateErr == errConditionalPreviewOnly {
+			intent, err := orderintent.NormalizeConditionalCancel(orderintent.ConditionalCancelIntent{ID: args[0]})
+			if err != nil {
+				return err
+			}
+			preview := app.tradingService.PreviewConditionalCancel(intent)
+			if !cancelExec {
 				fmt.Fprintf(cmd.OutOrStdout(), "%s\n%s: %s\n",
 					i18n.T("order.conditional.cancel.previewLine"),
 					i18n.T("order.conditional.confirmToken"),
-					orderintent.ConfirmToken(canonical))
+					preview.ConfirmToken)
 				return nil
 			}
-			if gateErr != nil {
-				return gateErr
-			}
-			if err := app.client.CancelConditionalOrder(cmd.Context(), intent); err != nil {
+			if err := app.tradingService.CancelConditional(cmd.Context(), intent, trading.ExecuteOptions{Execute: true, Confirm: cancelConfirm}); err != nil {
 				return userFacingCommandError(err)
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), i18n.T("order.conditional.cancel.done"))
@@ -579,32 +578,36 @@ func newOrderConditionalCmd(opts *rootOptions) *cobra.Command {
 		Use:         "place",
 		Short:       i18n.T("order.conditional.place.short"),
 		Long:        i18n.T("order.conditional.place.long"),
-		Annotations: map[string]string{"source": "official", "mutating": "true"},
+		Annotations: mutationAnnotations("official", "securities", "financial", "irreversible"),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app, err := newAppContext(opts)
 			if err != nil {
 				return err
 			}
-			intent := orderintent.ConditionalPlaceIntent{
-				Symbol: plSymbol, Type: plType, OrderType: plOrderType, ExpireDate: plExpire,
-				Quantity: plQty, ClientOrderID: plClientID, ConfirmHighValue: plConfirmHigh,
-				First: orderintent.ConditionLeg{OrderSide: plFirstSide, TriggerPrice: plFirstTrigger, OrderPrice: plFirstOrder},
+			kind, err := orderintent.ParseConditionalType(plType)
+			if err != nil {
+				return err
 			}
-			if plType == "OCO" || plType == "OTO" {
-				if plSecondSide == "" {
-					return fmt.Errorf("--second-side/--second-trigger required for %s", plType)
-				}
+			intent := orderintent.ConditionalPlaceIntent{
+				Symbol: plSymbol, ClientOrderID: plClientID, ConfirmHighValue: plConfirmHigh,
+				ConditionalShape: orderintent.ConditionalShape{
+					Type: kind, OrderType: orderintent.ConditionalOrderType(plOrderType), ExpireDate: plExpire,
+					Quantity: plQty,
+					First:    orderintent.ConditionLeg{OrderSide: plFirstSide, TriggerPrice: plFirstTrigger, OrderPrice: plFirstOrder},
+				},
+			}
+			if kind.RequiresSecondLeg() {
 				intent.Second = &orderintent.ConditionLeg{OrderSide: plSecondSide, TriggerPrice: plSecondTrigger, OrderPrice: plSecondOrder}
 			}
-			canonical := orderintent.CanonicalConditionalPlace(intent)
-			gateErr := conditionalGate(app.config, canonical, plExec, plConfirm)
-			if gateErr == errConditionalPreviewOnly {
-				return output.WriteConditionalPlacePreview(cmd.OutOrStdout(), intent, orderintent.ConfirmToken(canonical))
+			intent, err = orderintent.NormalizeConditionalPlace(intent)
+			if err != nil {
+				return err
 			}
-			if gateErr != nil {
-				return gateErr
+			preview := app.tradingService.PreviewConditionalPlace(intent)
+			if !plExec {
+				return output.WriteConditionalPlacePreview(cmd.OutOrStdout(), intent, preview.ConfirmToken)
 			}
-			ref, err := app.client.CreateConditionalOrder(cmd.Context(), intent)
+			ref, err := app.tradingService.PlaceConditional(cmd.Context(), intent, trading.ExecuteOptions{Execute: true, Confirm: plConfirm})
 			if err != nil {
 				return userFacingCommandError(err)
 			}
@@ -637,35 +640,39 @@ func newOrderConditionalCmd(opts *rootOptions) *cobra.Command {
 		Use:         "modify <conditional-order-id>",
 		Short:       i18n.T("order.conditional.modify.short"),
 		Args:        cobra.ExactArgs(1),
-		Annotations: map[string]string{"source": "official", "mutating": "true"},
+		Annotations: mutationAnnotations("official", "securities", "financial", "irreversible"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, err := newAppContext(opts)
 			if err != nil {
 				return err
 			}
-			intent := orderintent.ConditionalModifyIntent{
-				ID: args[0], Type: mdType, OrderType: mdOrderType, ExpireDate: mdExpire,
-				Quantity: mdQty, ConfirmHighValue: mdConfirmHigh,
-				First: orderintent.ConditionLeg{OrderSide: mdFirstSide, TriggerPrice: mdFirstTrigger, OrderPrice: mdFirstOrder},
+			kind, err := orderintent.ParseConditionalType(mdType)
+			if err != nil {
+				return err
 			}
-			if mdType == "OCO" || mdType == "OTO" {
-				if mdSecondSide == "" {
-					return fmt.Errorf("--second-side/--second-trigger required for %s", mdType)
-				}
+			intent := orderintent.ConditionalModifyIntent{
+				ID: args[0], ConfirmHighValue: mdConfirmHigh,
+				ConditionalShape: orderintent.ConditionalShape{
+					Type: kind, OrderType: orderintent.ConditionalOrderType(mdOrderType), ExpireDate: mdExpire,
+					Quantity: mdQty,
+					First:    orderintent.ConditionLeg{OrderSide: mdFirstSide, TriggerPrice: mdFirstTrigger, OrderPrice: mdFirstOrder},
+				},
+			}
+			if kind.RequiresSecondLeg() {
 				intent.Second = &orderintent.ConditionLeg{OrderSide: mdSecondSide, TriggerPrice: mdSecondTrigger, OrderPrice: mdSecondOrder}
 			}
-			canonical := orderintent.CanonicalConditionalModify(intent)
-			gateErr := conditionalGate(app.config, canonical, mdExec, mdConfirm)
-			if gateErr == errConditionalPreviewOnly {
+			intent, err = orderintent.NormalizeConditionalModify(intent)
+			if err != nil {
+				return err
+			}
+			preview := app.tradingService.PreviewConditionalModify(intent)
+			if !mdExec {
 				fmt.Fprintf(cmd.OutOrStdout(), "%s %s x%s\n%s: %s\n",
 					intent.ID, intent.Type, strconv.FormatFloat(intent.Quantity, 'f', -1, 64),
-					i18n.T("order.conditional.confirmToken"), orderintent.ConfirmToken(canonical))
+					i18n.T("order.conditional.confirmToken"), preview.ConfirmToken)
 				return nil
 			}
-			if gateErr != nil {
-				return gateErr
-			}
-			if err := app.client.ModifyConditionalOrder(cmd.Context(), intent); err != nil {
+			if err := app.tradingService.ModifyConditional(cmd.Context(), intent, trading.ExecuteOptions{Execute: true, Confirm: mdConfirm}); err != nil {
 				return userFacingCommandError(err)
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), i18n.T("order.conditional.modify.done"))

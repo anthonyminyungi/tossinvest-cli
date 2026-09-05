@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -494,26 +495,85 @@ func (c *Client) GetIndexDetail(ctx context.Context, query string) (domain.Index
 		return domain.IndexQuote{}, fmt.Errorf("index %q not found (available: %s)", query, strings.Join(names, ", "))
 	}
 
-	var envelope quoteEnvelope[struct {
-		Open    float64 `json:"open"`
-		High    float64 `json:"high"`
-		Low     float64 `json:"low"`
-		Close   float64 `json:"close"`
-		Volume  float64 `json:"volume"`
-		Base    float64 `json:"base"`
-		High52w float64 `json:"high52w"`
-		Low52w  float64 `json:"low52w"`
+	var priceEnvelope quoteEnvelope[struct {
+		Open    *float64 `json:"open"`
+		High    *float64 `json:"high"`
+		Low     *float64 `json:"low"`
+		Close   *float64 `json:"close"`
+		Volume  float64  `json:"volume"`
+		Base    *float64 `json:"base"`
+		High52w float64  `json:"high52w"`
+		Low52w  float64  `json:"low52w"`
 	}]
-	endpoint := fmt.Sprintf("%s/api/v1/index-prices/%s", c.infoBaseURL, url.PathEscape(matched.Code))
-	if err := c.getJSON(ctx, endpoint, &envelope); err != nil {
+	var infoEnvelope quoteEnvelope[struct {
+		Code      string `json:"code"`
+		Name      string `json:"name"`
+		PriceFeed *struct {
+			Code        *string `json:"code"`
+			Description *string `json:"description"`
+		} `json:"priceFeedType"`
+		TradingStartAt *string `json:"tradingStartAt"`
+		TradingEndAt   *string `json:"tradingEndAt"`
+		MarketOpen     *bool   `json:"isMarketOpen"`
+	}]
+	code := url.PathEscape(matched.Code)
+	if err := runReadBatch(
+		readTask{label: "index price", run: func() error {
+			if err := c.getJSON(ctx, fmt.Sprintf("%s/api/v1/index-prices/%s", c.infoBaseURL, code), &priceEnvelope); err != nil {
+				return err
+			}
+			price := priceEnvelope.Result
+			var missing []string
+			for name, value := range map[string]*float64{
+				"open": price.Open, "high": price.High, "low": price.Low,
+				"close": price.Close, "base": price.Base,
+			} {
+				if value == nil {
+					missing = append(missing, name)
+				}
+			}
+			if len(missing) > 0 {
+				sort.Strings(missing)
+				return fmt.Errorf("response missing required fields: %s", strings.Join(missing, ", "))
+			}
+			return nil
+		}},
+		readTask{label: "index session metadata", run: func() error {
+			return c.getJSON(ctx, fmt.Sprintf("%s/api/v2/index-infos/%s", c.infoBaseURL, code), &infoEnvelope)
+		}},
+	); err != nil {
 		return domain.IndexQuote{}, err
 	}
-	r := envelope.Result
+	info := infoEnvelope.Result
+	var missing []string
+	if info.PriceFeed == nil || info.PriceFeed.Code == nil {
+		missing = append(missing, "priceFeedType.code")
+	}
+	if info.PriceFeed == nil || info.PriceFeed.Description == nil {
+		missing = append(missing, "priceFeedType.description")
+	}
+	if info.TradingStartAt == nil {
+		missing = append(missing, "tradingStartAt")
+	}
+	if info.TradingEndAt == nil {
+		missing = append(missing, "tradingEndAt")
+	}
+	if info.MarketOpen == nil {
+		missing = append(missing, "isMarketOpen")
+	}
+	if len(missing) > 0 {
+		return domain.IndexQuote{}, fmt.Errorf("index session metadata missing required fields: %s", strings.Join(missing, ", "))
+	}
+	r := priceEnvelope.Result
 	out := domain.IndexQuote{
 		Code: matched.Code, Name: matched.Name, Nation: matched.Nation,
-		Open: r.Open, High: r.High, Low: r.Low, Close: r.Close, Base: r.Base,
+		Open: *r.Open, High: *r.High, Low: *r.Low, Close: *r.Close, Base: *r.Base,
 		Volume: r.Volume, High52w: r.High52w, Low52w: r.Low52w,
-		FetchedAt: time.Now().UTC(),
+		PriceFeed:      domain.IndexPriceFeed{Code: *info.PriceFeed.Code, Description: *info.PriceFeed.Description},
+		TradingStartAt: *info.TradingStartAt,
+		TradingEndAt:   *info.TradingEndAt,
+		MarketOpen:     *info.MarketOpen,
+		FetchedAt:      time.Now().UTC(),
 	}
 	out.Change = out.Close - out.Base
 	if out.Base != 0 {
@@ -874,42 +934,106 @@ func (c *Client) GetEarningCallHome(ctx context.Context) (domain.EarningCalls, e
 	return out, nil
 }
 
-// GetNewsBriefing returns the personalized AI news briefing grouped by theme
-// (개인화 뉴스 브리핑). 공식 API 에 없는 web 전용 기능.
-func (c *Client) GetNewsBriefing(ctx context.Context) (domain.NewsBriefing, error) {
-	var envelope quoteEnvelope[struct {
+type newsBriefingRaw struct {
+	CreatedAt string `json:"createdAt"`
+	Items     []struct {
+		Section   string `json:"section"`
+		SignalID  string `json:"signalId"`
+		TraceID   string `json:"traceId"`
 		CreatedAt string `json:"createdAt"`
-		Items     []struct {
-			Category struct {
-				Keywords []string `json:"keywords"`
-				Type     string   `json:"type"`
-			} `json:"category"`
-			News []struct {
-				Title      string `json:"title"`
-				AgencyName string `json:"agencyName"`
-				Source     string `json:"source"`
-				CreatedAt  string `json:"createdAt"`
-			} `json:"news"`
-		} `json:"items"`
-	}]
-	endpoint := c.infoBaseURL + "/api/v1/dashboard/wts/overview/ai-signals/personalized"
-	if err := c.getJSON(ctx, endpoint, &envelope); err != nil {
-		return domain.NewsBriefing{}, err
-	}
-	out := domain.NewsBriefing{CreatedAt: envelope.Result.CreatedAt, FetchedAt: time.Now().UTC()}
-	for _, it := range envelope.Result.Items {
-		bi := domain.BriefingItem{CategoryType: it.Category.Type, Keywords: it.Category.Keywords}
+		Category  struct {
+			Keywords []string `json:"keywords"`
+			Type     string   `json:"type"`
+		} `json:"category"`
+		ReasoningSummary struct {
+			AssetInfo struct {
+				Code         string `json:"code"`
+				Name         string `json:"name"`
+				LogoImageURL string `json:"logoImageUrl"`
+			} `json:"assetInfo"`
+			AssetType       string  `json:"assetType"`
+			InvestmentType  string  `json:"investmentType"`
+			ProfitLossRate  float64 `json:"profitLossRate"`
+			ReasoningTitle  string  `json:"reasoningTitle"`
+			SignalDirection int     `json:"signalDirection"`
+		} `json:"reasoningSummary"`
+		News []struct {
+			ID         string `json:"id"`
+			Title      string `json:"title"`
+			AgencyName string `json:"agencyName"`
+			Source     string `json:"source"`
+			FaviconURL string `json:"faviconUrl"`
+			CreatedAt  string `json:"createdAt"`
+		} `json:"news"`
+		RelatedStocks []relatedStockRaw `json:"relatedStocks"`
+	} `json:"items"`
+}
+
+func mapNewsBriefing(raw newsBriefingRaw, scope string) domain.NewsBriefing {
+	out := domain.NewsBriefing{CreatedAt: raw.CreatedAt, Scope: scope, Items: make([]domain.BriefingItem, 0, len(raw.Items)), FetchedAt: time.Now().UTC()}
+	for _, it := range raw.Items {
+		bi := domain.BriefingItem{
+			CategoryType:      it.Category.Type,
+			Keywords:          it.Category.Keywords,
+			Section:           it.Section,
+			SignalID:          it.SignalID,
+			TraceID:           it.TraceID,
+			CreatedAt:         it.CreatedAt,
+			AssetCode:         it.ReasoningSummary.AssetInfo.Code,
+			AssetName:         it.ReasoningSummary.AssetInfo.Name,
+			AssetLogoImageURL: it.ReasoningSummary.AssetInfo.LogoImageURL,
+			AssetType:         it.ReasoningSummary.AssetType,
+			InvestmentType:    it.ReasoningSummary.InvestmentType,
+			ProfitLossRate:    it.ReasoningSummary.ProfitLossRate,
+			ReasoningTitle:    it.ReasoningSummary.ReasoningTitle,
+			SignalDirection:   it.ReasoningSummary.SignalDirection,
+			RelatedStocks:     mapRelatedStocks(it.RelatedStocks),
+		}
 		for _, n := range it.News {
 			bi.News = append(bi.News, domain.BriefingNews{
-				Title:     n.Title,
-				Agency:    n.AgencyName,
-				Source:    n.Source,
-				CreatedAt: n.CreatedAt,
+				ID:         n.ID,
+				Title:      n.Title,
+				Agency:     n.AgencyName,
+				Source:     n.Source,
+				FaviconURL: n.FaviconURL,
+				CreatedAt:  n.CreatedAt,
 			})
 		}
 		out.Items = append(out.Items, bi)
 	}
-	return out, nil
+	return out
+}
+
+// GetNewsBriefing returns the personalized AI news briefing grouped by theme
+// and enriched with the holding/watchlist context behind each signal. v2 adds
+// asset, return, direction, and reasoning title while preserving the v1 news
+// fields consumed by existing callers. 공식 API 에 없는 web 전용 기능.
+func (c *Client) GetNewsBriefing(ctx context.Context) (domain.NewsBriefing, error) {
+	var envelope quoteEnvelope[newsBriefingRaw]
+	if err := c.getJSON(ctx, c.certBaseURL+"/api/v2/reasoning/personalized", &envelope); err != nil {
+		return domain.NewsBriefing{}, err
+	}
+	return mapNewsBriefing(envelope.Result, "personalized"), nil
+}
+
+// GetMarketNewsBriefing returns the latest AI briefing for the Korean or US
+// market. It is not personalized and is available through the WTS session even
+// though the command-line surface does not otherwise expose the dashboard UI.
+func (c *Client) GetMarketNewsBriefing(ctx context.Context, market string) (domain.NewsBriefing, error) {
+	scope := strings.ToLower(strings.TrimSpace(market))
+	nationCode := map[string]string{"kr": "KOR", "us": "USA"}[scope]
+	if nationCode == "" {
+		return domain.NewsBriefing{}, fmt.Errorf("unsupported briefing market %q: use kr or us", market)
+	}
+	if err := c.requireSession(); err != nil {
+		return domain.NewsBriefing{}, err
+	}
+	endpoint := c.certBaseURL + "/api/v1/dashboard/wts/overview/ai-signals/latest?nationCode=" + url.QueryEscape(nationCode)
+	var envelope quoteEnvelope[newsBriefingRaw]
+	if err := c.getJSON(ctx, endpoint, &envelope); err != nil {
+		return domain.NewsBriefing{}, err
+	}
+	return mapNewsBriefing(envelope.Result, scope), nil
 }
 
 // GetEarningCalls returns the upcoming earnings-call (어닝콜) calendar.
@@ -940,6 +1064,56 @@ func (c *Client) GetEarningCalls(ctx context.Context) (domain.EarningCalls, erro
 		})
 	}
 	return out, nil
+}
+
+// GetEarningCallDetail returns the full metadata and published media links for
+// one event from the earnings-call calendar. The exact path-only contract was
+// verified against the current WTS bundle and a read-only live response.
+func (c *Client) GetEarningCallDetail(ctx context.Context, eventID int64) (domain.EarningCallDetail, error) {
+	if eventID <= 0 {
+		return domain.EarningCallDetail{}, fmt.Errorf("event id must be a positive integer")
+	}
+	var envelope quoteEnvelope[struct {
+		EventID                      int64    `json:"eventId"`
+		MarketCountry                string   `json:"marketCountry"`
+		Category                     string   `json:"category"`
+		DefaultSummarizationCategory string   `json:"defaultSummarizationCategory"`
+		Status                       string   `json:"status"`
+		Title                        string   `json:"title"`
+		LiveAt                       string   `json:"liveAt"`
+		WentLiveAt                   *string  `json:"wentLiveAt"`
+		AudioURL                     *string  `json:"audioUrl"`
+		TranscriptURL                *string  `json:"transcriptUrl"`
+		SlideFileURL                 *string  `json:"slideFileUrl"`
+		CompanyCode                  string   `json:"companyCode"`
+		CompanyName                  string   `json:"companyName"`
+		CompanyLogoImageURL          string   `json:"companyLogoImageUrl"`
+		RepresentativeStockSymbol    string   `json:"representativeStockSymbol"`
+		RepresentativeStockGUID      string   `json:"representativeStockGuid"`
+		RepresentativeStockCode      string   `json:"representativeStockCode"`
+		ReportID                     string   `json:"reportId"`
+		ReportItem                   string   `json:"reportItem"`
+		MTSLandingPath               string   `json:"mtsLandingPath"`
+		ConsensusGapRate             *float64 `json:"consensusGapRate"`
+		IsGapRateVisible             bool     `json:"isGapRateVisible"`
+		StockChangeRate              *float64 `json:"stockChangeRate"`
+	}]
+	endpoint := fmt.Sprintf("%s/api/v1/earning-call/events/%d/info", c.certBaseURL, eventID)
+	if err := c.getJSON(ctx, endpoint, &envelope); err != nil {
+		return domain.EarningCallDetail{}, err
+	}
+	raw := envelope.Result
+	return domain.EarningCallDetail{
+		EventID: raw.EventID, MarketCountry: raw.MarketCountry, Category: raw.Category,
+		DefaultSummarizationCategory: raw.DefaultSummarizationCategory, Status: raw.Status,
+		Title: raw.Title, LiveAt: raw.LiveAt, WentLiveAt: raw.WentLiveAt,
+		AudioURL: raw.AudioURL, TranscriptURL: raw.TranscriptURL, SlideFileURL: raw.SlideFileURL,
+		CompanyCode: raw.CompanyCode, CompanyName: raw.CompanyName, CompanyLogoImageURL: raw.CompanyLogoImageURL,
+		RepresentativeStockSymbol: raw.RepresentativeStockSymbol, RepresentativeStockGUID: raw.RepresentativeStockGUID,
+		RepresentativeStockCode: raw.RepresentativeStockCode, ReportID: raw.ReportID, ReportItem: raw.ReportItem,
+		MTSLandingPath: raw.MTSLandingPath, ConsensusGapRate: raw.ConsensusGapRate,
+		IsGapRateVisible: raw.IsGapRateVisible, StockChangeRate: raw.StockChangeRate, FetchedAt: time.Now().UTC(),
+	}, nil
 }
 
 // haltMarketNames maps Toss's market code to a readable name. An unmapped code

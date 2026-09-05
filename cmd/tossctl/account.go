@@ -16,6 +16,10 @@ func newAccountCmd(opts *rootOptions) *cobra.Command {
 		newAccountDetailCmd(opts),
 		newAccountInterestCmd(opts),
 		newAccountBuyingPowerCmd(opts),
+		newAccountOverviewCmd(opts),
+		newAccountTradingSettingsCmd(opts),
+		newAccountTransferAccountsCmd(opts),
+		newAccountAccessStatusCmd(opts),
 		&cobra.Command{
 			Use:         "list",
 			Short:       i18n.T("account.list.short"),
@@ -93,6 +97,104 @@ func newAccountCmd(opts *rootOptions) *cobra.Command {
 		newAccountReceivableCmd(opts),
 	)
 
+	return cmd
+}
+
+func newAccountAccessStatusCmd(opts *rootOptions) *cobra.Command {
+	var account string
+	cmd := &cobra.Command{
+		Use:         "access-status",
+		Short:       i18n.T("account.accessStatus.short"),
+		Long:        i18n.T("account.accessStatus.long"),
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{"source": "wts", "domain": "securities"},
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			app, err := newAppContext(opts)
+			if err != nil {
+				return err
+			}
+			status, err := app.client.GetAccountAccessStatus(cmd.Context(), account)
+			if err != nil {
+				return userFacingCommandError(err)
+			}
+			return output.WriteAccountAccessStatus(cmd.OutOrStdout(), app.format, status)
+		},
+	}
+	cmd.Flags().StringVar(&account, "account", "", "Securities account key (default: primary account)")
+	return cmd
+}
+
+func newAccountTransferAccountsCmd(opts *rootOptions) *cobra.Command {
+	var full bool
+	var account string
+	cmd := &cobra.Command{
+		Use:         "transfer-accounts",
+		Short:       i18n.T("account.transferAccounts.short"),
+		Long:        i18n.T("account.transferAccounts.long"),
+		Annotations: map[string]string{"source": "wts", "domain": "securities"},
+		Args:        cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			app, err := newAppContext(opts)
+			if err != nil {
+				return err
+			}
+			accounts, err := app.client.GetSecuritiesTransferAccounts(cmd.Context(), account)
+			if err != nil {
+				return userFacingCommandError(err)
+			}
+			return output.WriteSecuritiesTransferAccounts(cmd.OutOrStdout(), app.format, accounts, full)
+		},
+	}
+	cmd.Flags().StringVar(&account, "account", "", "Securities account key (default: primary account)")
+	cmd.Flags().BoolVar(&full, "full", false, "show complete account numbers (default masks them)")
+	return cmd
+}
+
+func newAccountTradingSettingsCmd(opts *rootOptions) *cobra.Command {
+	var account string
+	cmd := &cobra.Command{
+		Use:         "trading-settings",
+		Short:       i18n.T("account.tradingSettings.short"),
+		Long:        i18n.T("account.tradingSettings.long"),
+		Annotations: map[string]string{"source": "wts", "domain": "securities"},
+		Args:        cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			app, err := newAppContext(opts)
+			if err != nil {
+				return err
+			}
+			settings, err := app.client.GetTradingSettings(cmd.Context(), account)
+			if err != nil {
+				return userFacingCommandError(err)
+			}
+			return output.WriteTradingSettings(cmd.OutOrStdout(), app.format, settings)
+		},
+	}
+	cmd.Flags().StringVar(&account, "account", "", "Securities account key (default: primary account)")
+	return cmd
+}
+
+func newAccountOverviewCmd(opts *rootOptions) *cobra.Command {
+	var full bool
+	cmd := &cobra.Command{
+		Use:         "overview",
+		Short:       i18n.T("account.overview.short"),
+		Long:        i18n.T("account.overview.long"),
+		Annotations: map[string]string{"source": "wts"},
+		Args:        cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			app, err := newAppContext(opts)
+			if err != nil {
+				return err
+			}
+			overview, err := app.client.GetAccountOverview(cmd.Context())
+			if err != nil {
+				return userFacingCommandError(err)
+			}
+			return output.WriteAccountOverview(cmd.OutOrStdout(), app.format, overview, full)
+		},
+	}
+	cmd.Flags().BoolVar(&full, "full", false, "show account numbers in full (default masks them)")
 	return cmd
 }
 

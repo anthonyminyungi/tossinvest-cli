@@ -4,14 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/JungHoonGhae/tossinvest-cli/internal/routing"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/version"
 )
 
 const (
-	SchemaVersion = 4
+	SchemaVersion = 5
 	// DefaultSchemaURL is derived from version.Repo (single source of truth).
 	DefaultSchemaURL = "https://raw.githubusercontent.com/" + version.Repo + "/main/schemas/config.schema.json"
 )
@@ -80,44 +82,35 @@ type UpdateCheck struct {
 // OpenAPI holds routing preferences for the official Toss Open API.
 // Credential secrets are stored in a separate file (see paths.CredentialsFile).
 type OpenAPI struct {
-	Enabled  bool   `json:"enabled"`
-	Prefer   string `json:"prefer"` // auto | wts | openapi
-	Fallback bool   `json:"fallback"`
+	Enabled  bool               `json:"enabled"`
+	Prefer   routing.Preference `json:"prefer"`
+	Fallback bool               `json:"fallback"`
 }
 
-// NormalizeBackend canonicalizes a routing-backend value used by the
-// `--backend` flag and `openapi.prefer`. "official" is accepted as a
-// deprecated alias for "openapi" (the official Open API path). Returns
-// ("", false) for unknown values.
-func NormalizeBackend(v string) (string, bool) {
-	switch v {
-	case "auto", "wts", "openapi":
-		return v, true
-	case "official": // deprecated alias → openapi
-		return "openapi", true
-	default:
-		return "", false
-	}
+type Experimental struct {
+	PaperTrading bool `json:"paper_trading"`
 }
 
 type File struct {
-	Schema        string      `json:"$schema,omitempty"`
-	SchemaVersion int         `json:"schema_version"`
-	Trading       Trading     `json:"trading"`
-	UpdateCheck   UpdateCheck `json:"update_check"`
-	OpenAPI       OpenAPI     `json:"openapi"`
+	Schema        string       `json:"$schema,omitempty"`
+	SchemaVersion int          `json:"schema_version"`
+	Trading       Trading      `json:"trading"`
+	UpdateCheck   UpdateCheck  `json:"update_check"`
+	OpenAPI       OpenAPI      `json:"openapi"`
+	Experimental  Experimental `json:"experimental"`
 }
 
 type Status struct {
-	ConfigFile          string      `json:"config_file"`
-	Exists              bool        `json:"exists"`
-	Schema              string      `json:"$schema,omitempty"`
-	SchemaVersion       int         `json:"schema_version"`
-	SourceSchemaVersion int         `json:"source_schema_version,omitempty"`
-	LegacyFields        []string    `json:"legacy_fields,omitempty"`
-	Trading             Trading     `json:"trading"`
-	UpdateCheck         UpdateCheck `json:"update_check"`
-	OpenAPI             OpenAPI     `json:"openapi"`
+	ConfigFile          string       `json:"config_file"`
+	Exists              bool         `json:"exists"`
+	Schema              string       `json:"$schema,omitempty"`
+	SchemaVersion       int          `json:"schema_version"`
+	SourceSchemaVersion int          `json:"source_schema_version,omitempty"`
+	LegacyFields        []string     `json:"legacy_fields,omitempty"`
+	Trading             Trading      `json:"trading"`
+	UpdateCheck         UpdateCheck  `json:"update_check"`
+	OpenAPI             OpenAPI      `json:"openapi"`
+	Experimental        Experimental `json:"experimental"`
 }
 
 type InitResult struct {
@@ -159,9 +152,9 @@ type rawUpdateCheck struct {
 }
 
 type rawOpenAPI struct {
-	Enabled  *bool  `json:"enabled"`
-	Prefer   string `json:"prefer"`
-	Fallback *bool  `json:"fallback"`
+	Enabled  *bool           `json:"enabled"`
+	Prefer   json.RawMessage `json:"prefer"`
+	Fallback *bool           `json:"fallback"`
 }
 
 type rawFile struct {
@@ -170,6 +163,7 @@ type rawFile struct {
 	Trading       rawTrading     `json:"trading"`
 	UpdateCheck   rawUpdateCheck `json:"update_check"`
 	OpenAPI       *rawOpenAPI    `json:"openapi,omitempty"`
+	Experimental  Experimental   `json:"experimental"`
 }
 
 func NewService(path string) *Service {
@@ -182,7 +176,8 @@ func DefaultFile() File {
 		SchemaVersion: SchemaVersion,
 		Trading:       Trading{},
 		UpdateCheck:   UpdateCheck{Enabled: true},
-		OpenAPI:       OpenAPI{Enabled: true, Prefer: "auto", Fallback: true},
+		OpenAPI:       OpenAPI{Enabled: true, Prefer: routing.Auto, Fallback: true},
+		Experimental:  Experimental{},
 	}
 }
 
@@ -206,6 +201,7 @@ func (s *Service) Status(context.Context) (Status, error) {
 		Trading:             cfg.Trading,
 		UpdateCheck:         cfg.UpdateCheck,
 		OpenAPI:             cfg.OpenAPI,
+		Experimental:        cfg.Experimental,
 	}, nil
 }
 
@@ -309,7 +305,7 @@ func (s *Service) load() (File, bool, legacyMetadata, error) {
 	}
 
 	// OpenAPI: absent block → defaults (Enabled=true, Prefer="auto", Fallback=true).
-	// Present block: merge per-field defaults, then normalize invalid Prefer to "auto".
+	// Present block: merge per-field defaults and reject an explicitly invalid Prefer.
 	if raw.OpenAPI != nil {
 		if raw.OpenAPI.Enabled != nil {
 			cfg.OpenAPI.Enabled = *raw.OpenAPI.Enabled
@@ -317,14 +313,33 @@ func (s *Service) load() (File, bool, legacyMetadata, error) {
 		if raw.OpenAPI.Fallback != nil {
 			cfg.OpenAPI.Fallback = *raw.OpenAPI.Fallback
 		}
-		if norm, ok := NormalizeBackend(raw.OpenAPI.Prefer); ok {
+		if raw.OpenAPI.Prefer != nil {
+			var value *string
+			if err := json.Unmarshal(raw.OpenAPI.Prefer, &value); err != nil {
+				return File{}, true, meta, fmt.Errorf("invalid openapi.prefer: %w", err)
+			}
+			if value == nil {
+				return File{}, true, meta, fmt.Errorf("invalid openapi.prefer value %s: must be one of auto, wts, openapi", raw.OpenAPI.Prefer)
+			}
+			norm, ok := routing.ParsePreference(*value)
+			if !ok {
+				return File{}, true, meta, fmt.Errorf("invalid openapi.prefer value %q: must be one of auto, wts, openapi", *value)
+			}
 			cfg.OpenAPI.Prefer = norm
-		} else {
-			cfg.OpenAPI.Prefer = "auto"
 		}
 	}
+	cfg.Experimental = raw.Experimental
 
 	return cfg, true, meta, nil
+}
+
+func (s *Service) SetExperimentalPaperTrading(ctx context.Context, enabled bool) error {
+	cfg, _, _, err := s.load()
+	if err != nil {
+		return err
+	}
+	cfg.Experimental.PaperTrading = enabled
+	return s.save(cfg)
 }
 
 func (s *Service) save(cfg File) error {

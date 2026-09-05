@@ -83,7 +83,7 @@ func argStringSlice(args map[string]any, name string) ([]string, error) {
 func readOperations() []Operation {
 	return []Operation{
 		{
-			ID: "auth_status", Method: "GET", Path: "local:auth-status", Backend: "none",
+			ID: "auth_status", Method: "GET", Path: "local:auth-status", Backend: "none", Domain: "system",
 			Category: "system", Summary: "Which backends are connected and when they expire — WTS web session and official Open API key. No secrets returned. Call this to diagnose auth before other operations; a disconnected/expired backend means run `tossctl auth login` (WTS) or `tossctl openapi login` (official).",
 			handler: func(_ context.Context, d *Deps, _ map[string]any) (any, error) {
 				return d.Auth, nil
@@ -168,6 +168,50 @@ func readOperations() []Operation {
 					return nil, err
 				}
 				return d.Client.OrderByID(ctx, orderID)
+			},
+		},
+		{
+			ID: "conditional_orders", Method: "GET", Path: "/api/v1/conditional-orders",
+			Category: "order", Summary: "List conditional orders. Returns one page; pass next_cursor back as cursor when has_next is true.",
+			Params: []Param{
+				{Name: "status", Type: "string", Desc: `"OPEN" (default) or "CLOSED"`},
+				{Name: "symbol", Type: "string"},
+				{Name: "cursor", Type: "string", Desc: "next_cursor from a previous response"},
+				{Name: "limit", Type: "integer", Desc: "orders per page (0 = API default)"},
+			},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				status, err := argString(args, "status")
+				if err != nil {
+					return nil, err
+				}
+				if status == "" {
+					status = "OPEN"
+				}
+				symbol, err := argString(args, "symbol")
+				if err != nil {
+					return nil, err
+				}
+				cursor, err := argString(args, "cursor")
+				if err != nil {
+					return nil, err
+				}
+				limit, err := argInt(args, "limit")
+				if err != nil {
+					return nil, err
+				}
+				return d.Client.ConditionalOrders(ctx, status, symbol, cursor, limit)
+			},
+		},
+		{
+			ID: "conditional_order", Method: "GET", Path: "/api/v1/conditional-orders/{conditionalOrderId}",
+			Category: "order", Summary: "Fetch one conditional order by id.",
+			Params: []Param{{Name: "conditional_order_id", Type: "string", Required: true}},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				id, err := argString(args, "conditional_order_id")
+				if err != nil {
+					return nil, err
+				}
+				return d.Client.ConditionalOrder(ctx, id)
 			},
 		},
 		{

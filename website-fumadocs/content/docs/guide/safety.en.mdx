@@ -12,14 +12,32 @@ explicitly allow them in `config.json`.
 
 ```json
 {
-  "trading": { "grant": ["place", "sell"] }
+  "trading": {
+    "place": true,
+    "sell": true,
+    "allow_live_order_actions": true
+  }
 }
 ```
 
 - Without `place`, no order can be placed.
 - Selling requires the additional `sell` grant (the user scopes "buy-only / include sell").
+- `allow_live_order_actions` is the master kill switch for every live-account order.
 
 ## Two-step execution gate
+
+```mermaid
+flowchart LR
+    intent["Order intent"] --> preview["Preview"]
+    preview --> review{"Human review"}
+    review -- "Reject or revise" --> stop["Do not execute"]
+    review -- "Approve" --> gates{"Config + execute + confirm"}
+    gates -- "Any gate fails" --> blocked["Blocked"]
+    gates -- "All pass" --> submit["Submit through one selected backend"]
+    submit --> outcome{"Outcome"}
+    outcome -- "Known" --> done["Return result"]
+    outcome -- "Unknown" --> reconcile["Inspect order state before retry"]
+```
 
 A live trade requires both:
 
@@ -54,5 +72,5 @@ asymmetric option was removed.)
 
 ## Agent notes
 
-Follow the rules in the [AI Agent Guide](agents.en.md) — especially no gate bypass, no real
+Follow the rules in the [AI Agent Guide](/en/docs/guide/agents) — especially no gate bypass, no real
 data exposure, and preview-before-place.

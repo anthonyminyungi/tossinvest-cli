@@ -4,35 +4,89 @@ on:
   push:
     branches:
       - main
+      - "analysis/**"
+      - "automation/**"
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-and-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
         with:
           python-version: "3.11"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Enable Corepack
+        run: corepack enable
+
       - name: Run Go tests
         run: go test ./...
+
+      - name: Check Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
 
       # gofmt + go vet, same target contributors run locally.
       - name: Lint
         run: make lint
 
+      - name: Lint GitHub Actions workflows
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          actionlint
+          bash -n tools/open_automation_pr.sh
+          bash -n tools/codex_api_analysis.sh
+
       - name: Build CLI
         run: make build
+
+      - name: Install website dependencies
+        working-directory: website-fumadocs
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit website dependencies
+        working-directory: website-fumadocs
+        env:
+          npm_config_fetch_retries: "1"
+          npm_config_fetch_timeout: "10000"
+        # Advisories still fail the job. This only prevents npm registry
+        # availability from hiding the dependency-review result below.
+        run: pnpm audit --audit-level high --ignore-registry-errors
+
+      - name: Build documentation website
+        working-directory: website-fumadocs
+        run: pnpm build
+
+      - name: Review dependency changes
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
 
       - name: Check auth helper syntax
         run: python -m compileall auth-helper
@@ -49,3 +103,9 @@ jobs:
         run: |
           PYTHONHASHSEED=0 python3 -m unittest discover -s tools/tests
           PYTHONHASHSEED=1 python3 -m unittest discover -s tools/tests
+
+      - name: 카탈로그 스윕 병합 테스트
+        run: |
+          node --check tools/capture_post_bodies.mjs
+          node --check tools/catalog_observed.mjs
+          node --test tools/tests/*.test.mjs

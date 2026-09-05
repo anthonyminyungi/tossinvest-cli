@@ -185,6 +185,31 @@ func newMarketCmd(opts *rootOptions) *cobra.Command {
 		},
 	}
 
+	var signalType string
+	signalCmd := &cobra.Command{
+		Use:         "signal <symbol>",
+		Short:       i18n.T("market.signal.short"),
+		Long:        i18n.T("market.signal.long"),
+		Args:        cobra.ExactArgs(1),
+		Annotations: map[string]string{"source": "wts", "domain": "securities"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			productType, err := tossclient.AISignalProductType(signalType)
+			if err != nil {
+				return err
+			}
+			app, err := newAppContext(opts)
+			if err != nil {
+				return err
+			}
+			detail, err := app.client.GetAISignalDetail(cmd.Context(), args[0], productType)
+			if err != nil {
+				return userFacingCommandError(err)
+			}
+			return output.WriteAISignalDetail(cmd.OutOrStdout(), app.format, detail)
+		},
+	}
+	signalCmd.Flags().StringVar(&signalType, "type", "stocks", "product type: stocks or equity_etf")
+
 	var investorsSize int
 	investorsCmd := &cobra.Command{
 		Use:         "investors",
@@ -206,14 +231,33 @@ func newMarketCmd(opts *rootOptions) *cobra.Command {
 
 	var earningsMajor bool
 	earningsCmd := &cobra.Command{
-		Use:         "earnings",
+		Use:         "earnings [event-id]",
 		Short:       i18n.T("market.earnings.short"),
 		Long:        i18n.T("market.earnings.long"),
-		Annotations: map[string]string{"source": "wts"},
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		Args:        cobra.MaximumNArgs(1),
+		Annotations: map[string]string{"source": "wts", "domain": "securities"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 && earningsMajor {
+				return fmt.Errorf("--major cannot be used with an event id")
+			}
+			var eventID int64
+			if len(args) == 1 {
+				var parseErr error
+				eventID, parseErr = strconv.ParseInt(args[0], 10, 64)
+				if parseErr != nil || eventID <= 0 {
+					return fmt.Errorf("invalid event id %q: expected a positive integer", args[0])
+				}
+			}
 			app, err := newAppContext(opts)
 			if err != nil {
 				return err
+			}
+			if len(args) == 1 {
+				detail, detailErr := app.client.GetEarningCallDetail(cmd.Context(), eventID)
+				if detailErr != nil {
+					return userFacingCommandError(detailErr)
+				}
+				return output.WriteEarningCallDetail(cmd.OutOrStdout(), app.format, detail)
 			}
 			get := app.client.GetEarningCalls
 			if earningsMajor {
@@ -255,6 +299,28 @@ func newMarketCmd(opts *rootOptions) *cobra.Command {
 				sectors.Items = sub
 			}
 			return output.WriteSectors(cmd.OutOrStdout(), app.format, sectors)
+		},
+	}
+	sectorCmd := &cobra.Command{
+		Use:         "sector <id>",
+		Short:       i18n.T("market.sector.short"),
+		Long:        i18n.T("market.sector.long"),
+		Args:        cobra.ExactArgs(1),
+		Annotations: map[string]string{"source": "wts", "domain": "securities"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := strconv.Atoi(args[0])
+			if err != nil || id <= 0 {
+				return fmt.Errorf("invalid sector id %q (run `market sectors` to list ids)", args[0])
+			}
+			app, err := newAppContext(opts)
+			if err != nil {
+				return err
+			}
+			detail, err := app.client.GetSectorDetail(cmd.Context(), id)
+			if err != nil {
+				return userFacingCommandError(err)
+			}
+			return output.WriteSectorDetail(cmd.OutOrStdout(), app.format, detail)
 		},
 	}
 
@@ -336,23 +402,36 @@ func newMarketCmd(opts *rootOptions) *cobra.Command {
 	}
 	issuesCmd.Flags().BoolVar(&issuesFull, "full", false, "include the articles behind each topic")
 
+	var briefingScope string
 	briefingCmd := &cobra.Command{
 		Use:         "briefing",
 		Short:       i18n.T("market.briefing.short"),
 		Long:        i18n.T("market.briefing.long"),
-		Annotations: map[string]string{"source": "wts"},
+		Annotations: map[string]string{"source": "wts", "domain": "securities"},
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			scope := strings.ToLower(strings.TrimSpace(briefingScope))
+			if scope != "personalized" && scope != "kr" && scope != "us" {
+				return fmt.Errorf("invalid --scope %q: use personalized, kr, or us", briefingScope)
+			}
 			app, err := newAppContext(opts)
 			if err != nil {
 				return err
 			}
-			b, err := app.client.GetNewsBriefing(cmd.Context())
+			var b domain.NewsBriefing
+			switch scope {
+			case "personalized":
+				b, err = app.client.GetNewsBriefing(cmd.Context())
+			case "kr", "us":
+				b, err = app.client.GetMarketNewsBriefing(cmd.Context(), scope)
+			}
 			if err != nil {
-				return err
+				return userFacingCommandError(err)
 			}
 			return output.WriteNewsBriefing(cmd.OutOrStdout(), app.format, b)
 		},
 	}
+	briefingCmd.Flags().StringVar(&briefingScope, "scope", "personalized", "briefing scope: personalized, kr, or us")
 
 	var (
 		screenerNation string
@@ -582,6 +661,6 @@ func newMarketCmd(opts *rootOptions) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(hoursCmd, haltCmd, businessDaysCmd, anomaliesCmd, fxCmd, indexCmd, rankingCmd, signalsCmd, investorsCmd, earningsCmd, briefingCmd, newsCmd, sectorsCmd, themesCmd, screenerCmd, filtersCmd, stocksCmd, rankingsCmd, indicatorCmd, indicatorCandlesCmd, investorTradingCmd, calendarCmd, issuesCmd, optionHoursCmd)
+	cmd.AddCommand(hoursCmd, haltCmd, businessDaysCmd, anomaliesCmd, fxCmd, indexCmd, rankingCmd, signalsCmd, signalCmd, investorsCmd, earningsCmd, briefingCmd, newsCmd, sectorsCmd, sectorCmd, themesCmd, screenerCmd, filtersCmd, stocksCmd, rankingsCmd, indicatorCmd, indicatorCandlesCmd, investorTradingCmd, calendarCmd, newMarketKeyEventsCmd(opts), issuesCmd, optionHoursCmd)
 	return cmd
 }

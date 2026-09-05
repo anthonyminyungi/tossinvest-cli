@@ -43,13 +43,16 @@ description: 에이전트가 안전·정확하게 쓰는 규칙
 
 토스 공식 Open API 키를 등록하면 공식이 지원하는 조회·거래는 OAuth 경로로 처리되고 토큰이
 자동 갱신됩니다. 웹 세션(WTS)은 약 7일 활동 만료가 있어 사람의 폰 승인이 주기적으로 필요하지만,
-공식 경로는 그 제약이 없어 CI·서버·장기 실행 에이전트에 유리합니다. 키 없이도 모든 기능이
-동작합니다.
+공식 경로는 그 제약이 없어 CI·서버·장기 실행 에이전트에 유리합니다. 웹 세션만 있으면 WTS
+기능은 동작하지만 official-only 조회·조건주문·stream에는 공식 키가 필요합니다.
 
 - **비대화형 등록**: `TOSSCTL_OPENAPI_KEY` / `TOSSCTL_OPENAPI_SECRET` 환경변수를 설정한 뒤
   `tossctl openapi login` (플래그로도 전달 가능). 자격증명 파일은 `0600` 으로 저장된다.
 - `tossctl openapi status --output json` — 키·토큰·허용 IP·라우팅 진단. 공식 키는 **IP 허용
   목록**이 필요하니 서버 IP 등록 여부를 확인하라.
+- `tossctl openapi ip replace-current --output json` — 현재 공인 IP와 기존 목록을 비교한
+  교체 계획만 반환한다. 사용자가 계획을 승인한 뒤 preview의 `confirm_token`으로
+  `--execute --confirm <token>`을 호출한다. 각 변경을 서버에서 재검증하며 실패 시 실제 상태를 조회해 기존 허용 목록을 복구한다.
 - `tossctl <명령> --backend auto|wts|openapi` — 요청별 라우팅 백엔드 지정(기본 auto).
 - 처음 설정은 `tossctl init` 위저드로도 가능하다.
 - 자세한 내용: [공식 Open API 자동 라우팅](/docs/guide/hybrid-openapi).

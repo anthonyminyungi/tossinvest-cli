@@ -8,18 +8,33 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/JungHoonGhae/tossinvest-cli/internal/featuregate"
 )
 
 // 레지스트리 불변식 — 오퍼레이션을 추가할 때 이 테스트 하나가 형식 실수를 잡는다.
 func TestRegistryInvariants(t *testing.T) {
-	c := NewCatalog()
+	c := NewCatalog(featuregate.PaperTrading)
 	all := c.List("", 0)
 	if len(all) == 0 {
 		t.Fatal("empty catalog")
 	}
+	if got, want := c.Count(), len(c.ops); got != want {
+		t.Fatalf("Count() = %d, want complete registry size %d", got, want)
+	}
 
 	seenID := map[string]bool{}
 	seenProbe := map[string]bool{}
+	referencedProbe := map[string]bool{}
+	for _, probe := range sharedWTSProbes() {
+		if probe.Name == "" || probe.Check == nil {
+			t.Errorf("shared probe must have Name and Check")
+		}
+		if seenProbe[probe.Name] {
+			t.Errorf("duplicate shared probe name %q", probe.Name)
+		}
+		seenProbe[probe.Name] = true
+	}
 	for _, o := range all {
 		if o.ID == "" || o.Summary == "" || o.Category == "" {
 			t.Errorf("operation %+v: ID/Summary/Category must be set", o.ID)
@@ -28,6 +43,19 @@ func TestRegistryInvariants(t *testing.T) {
 			t.Errorf("duplicate operation id %q", o.ID)
 		}
 		seenID[o.ID] = true
+		for _, alias := range o.Aliases {
+			if alias == "" || alias == o.ID {
+				t.Errorf("%s: invalid operation alias %q", o.ID, alias)
+			}
+			if seenID[alias] {
+				t.Errorf("%s: duplicate operation id or alias %q", o.ID, alias)
+			}
+			seenID[alias] = true
+			resolved, ok := c.Get(alias)
+			if !ok || resolved.ID != o.ID {
+				t.Errorf("%s: alias %q did not resolve to canonical operation", o.ID, alias)
+			}
+		}
 
 		switch o.Backend {
 		case "", "wts", "none", "auto":
@@ -38,6 +66,38 @@ func TestRegistryInvariants(t *testing.T) {
 		if o.Backend == "wts" && !strings.HasPrefix(o.Path, "wts:") {
 			t.Errorf("%s: wts operation path %q must start with \"wts:\"", o.ID, o.Path)
 		}
+		if o.Write {
+			if o.Mutation == nil {
+				t.Errorf("%s: write operation is missing mutation policy", o.ID)
+			} else {
+				if o.Mutation.RiskLevel == "" || o.Mutation.Reversibility == "" ||
+					o.Mutation.AuthorizationMode == "" || o.Mutation.Verification == "" {
+					t.Errorf("%s: incomplete mutation policy: %#v", o.ID, o.Mutation)
+				}
+				switch o.Mutation.AuthorizationMode {
+				case MutationAuthorizationState:
+					if !o.Mutation.RequiresPreview || !o.Mutation.RequiresFreshConfirmation {
+						t.Errorf("%s: state-confirmation mutation must require preview and fresh state confirmation: %#v", o.ID, o.Mutation)
+					}
+				case MutationAuthorizationIntent:
+					if !o.Mutation.RequiresPreview || o.Mutation.RequiresFreshConfirmation {
+						t.Errorf("%s: intent-confirmation mutation must require preview without claiming state freshness: %#v", o.ID, o.Mutation)
+					}
+				case MutationAuthorizationMandate:
+					if o.Mutation.RequiresFreshConfirmation || !o.Mutation.RequiresConfigOptIn {
+						t.Errorf("%s: bounded-mandate mutation must use config opt-in instead of fresh confirmation: %#v", o.ID, o.Mutation)
+					}
+				case MutationAuthorizationSimulation:
+					if !o.Mutation.RequiresPreview || o.Mutation.RequiresFreshConfirmation || o.Mutation.RequiresConfigOptIn {
+						t.Errorf("%s: simulation mutation must preview without live confirmation or config opt-in: %#v", o.ID, o.Mutation)
+					}
+				default:
+					t.Errorf("%s: unknown mutation authorization mode %q", o.ID, o.Mutation.AuthorizationMode)
+				}
+			}
+		} else if o.Mutation != nil {
+			t.Errorf("%s: read operation unexpectedly declares mutation policy", o.ID)
+		}
 
 		for _, p := range o.Params {
 			switch p.Type {
@@ -47,27 +107,115 @@ func TestRegistryInvariants(t *testing.T) {
 			}
 		}
 
+		var probes []ProbeSpec
 		if o.Probe != nil {
-			if o.Probe.Name == "" || o.Probe.Check == nil {
+			probes = append(probes, *o.Probe)
+		}
+		probes = append(probes, o.ExtraProbes...)
+		for _, probe := range probes {
+			if probe.Name == "" || probe.Check == nil {
 				t.Errorf("%s: probe must have Name and Check", o.ID)
 			}
-			if seenProbe[o.Probe.Name] {
-				t.Errorf("%s: duplicate probe name %q", o.ID, o.Probe.Name)
+			if seenProbe[probe.Name] {
+				t.Errorf("%s: duplicate probe name %q", o.ID, probe.Name)
 			}
-			seenProbe[o.Probe.Name] = true
-			u, err := url.Parse(o.Probe.URL)
+			seenProbe[probe.Name] = true
+			u, err := url.Parse(probe.URL)
 			if err != nil || u.Scheme != "https" || !strings.HasSuffix(u.Host, ".tossinvest.com") {
-				t.Errorf("%s: probe URL %q must be https on *.tossinvest.com", o.ID, o.Probe.URL)
+				t.Errorf("%s: probe URL %q must be https on *.tossinvest.com", o.ID, probe.URL)
 			}
-			if o.Probe.Method != "GET" && o.Probe.Method != "POST" {
-				t.Errorf("%s: probe method %q must be GET or POST", o.ID, o.Probe.Method)
+			if probe.Method != "GET" && probe.Method != "POST" {
+				t.Errorf("%s: probe method %q must be GET or POST", o.ID, probe.Method)
 			}
+		}
+		for _, ref := range o.ProbeRefs {
+			if !seenProbe[ref] {
+				t.Errorf("%s: unknown shared probe reference %q", o.ID, ref)
+			}
+			referencedProbe[ref] = true
+		}
+	}
+	for _, probe := range sharedWTSProbes() {
+		if !referencedProbe[probe.Name] {
+			t.Errorf("shared probe %q is not referenced by any operation", probe.Name)
 		}
 	}
 
 	// Catalog.Probes() 는 선언된 probe 를 전부, 한 번씩 노출한다.
 	if got := len(c.Probes()); got != len(seenProbe) {
 		t.Errorf("Probes() returned %d specs, want %d", got, len(seenProbe))
+	}
+}
+
+func TestLegacyBankingStatusAliasResolvesToSecuritiesFunding(t *testing.T) {
+	t.Parallel()
+	catalog := NewCatalog()
+	canonical, ok := catalog.Get("accumulation_funding_status")
+	if !ok {
+		t.Fatal("accumulation_funding_status operation missing")
+	}
+	legacy, ok := catalog.Get("banking_status")
+	if !ok || legacy.ID != canonical.ID {
+		t.Fatalf("banking_status alias = %#v, want canonical %q", legacy, canonical.ID)
+	}
+	if canonical.Domain != "securities" || canonical.Category != "accumulate" {
+		t.Fatalf("canonical funding classification = domain %q category %q", canonical.Domain, canonical.Category)
+	}
+	found := catalog.List("banking_status", 0)
+	if len(found) != 1 || found[0].ID != canonical.ID || len(found[0].Aliases) != 1 || found[0].Aliases[0] != "banking_status" {
+		t.Fatalf("alias search = %#v", found)
+	}
+}
+
+func TestFinancialOperationsDeclareStrongestGuardrail(t *testing.T) {
+	t.Parallel()
+	catalog := NewCatalog()
+	for _, id := range []string{
+		"place_order", "cancel_order", "modify_order",
+		"place_conditional_order", "cancel_conditional_order", "modify_conditional_order",
+	} {
+		op, ok := catalog.Get(id)
+		if !ok {
+			t.Fatalf("missing operation %q", id)
+		}
+		if op.Mutation == nil || op.Mutation.RiskLevel != MutationRiskFinancial ||
+			op.Mutation.Reversibility != MutationIrreversible || !op.Mutation.RequiresConfigOptIn ||
+			op.Mutation.AuthorizationMode != MutationAuthorizationIntent || op.Mutation.RequiresFreshConfirmation {
+			t.Errorf("%s: weak financial mutation policy: %#v", id, op.Mutation)
+		}
+	}
+}
+
+func TestCatalogProbesIncludesOnlyReferencedSharedProbes(t *testing.T) {
+	local := ProbeSpec{Name: "local", Method: "GET", URL: "https://wts-api.tossinvest.com/local", Check: statusAndPath("result", "object")}
+	catalog := &Catalog{ops: []Operation{{ID: "example", Probe: &local}}}
+
+	probes := catalog.Probes()
+	if len(probes) != 1 || probes[0].Name != "local" {
+		t.Fatalf("unreferenced shared probes leaked into catalog: %#v", probes)
+	}
+}
+
+func TestExperimentalOperationsAreHiddenUntilOptedIn(t *testing.T) {
+	t.Parallel()
+	stable := NewCatalog()
+	if _, ok := stable.Get("get_paper_trading_status"); ok {
+		t.Fatal("paper operation leaked into the stable catalog")
+	}
+	if got := stable.List("paper", 0); len(got) != 0 {
+		t.Fatalf("paper operations leaked into stable discovery: %#v", got)
+	}
+	if _, err := stable.Call(context.Background(), nil, "get_paper_trading_status", nil); err == nil || !strings.Contains(err.Error(), "experimental") {
+		t.Fatalf("disabled experimental call error = %v", err)
+	}
+
+	enabled := NewCatalog(featuregate.PaperTrading)
+	op, ok := enabled.Get("get_paper_trading_status")
+	if !ok || op.Experimental != featuregate.PaperTrading {
+		t.Fatalf("enabled operation = %#v, found=%v", op, ok)
+	}
+	if enabled.Count() <= stable.Count() {
+		t.Fatalf("enabled count=%d stable count=%d", enabled.Count(), stable.Count())
 	}
 }
 

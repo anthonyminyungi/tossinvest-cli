@@ -13,6 +13,7 @@ import (
 	"github.com/JungHoonGhae/tossinvest-cli/internal/auth"
 	tossclient "github.com/JungHoonGhae/tossinvest-cli/internal/client"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/config"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/featuregate"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/hybrid"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/i18n"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/official"
@@ -20,6 +21,7 @@ import (
 	"github.com/JungHoonGhae/tossinvest-cli/internal/ops"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/orderlineage"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/output"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/routing"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/selfupdate"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/session"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/trading"
@@ -62,6 +64,15 @@ func newRootCmd() *cobra.Command {
 			format, err := output.ParseFormat(opts.outputFormat)
 			if err != nil {
 				return err
+			}
+			if feature := commandExperiment(cmd); feature != "" {
+				enabled, err := experimentEnabled(opts, feature)
+				if err != nil {
+					return err
+				}
+				if !enabled {
+					return experimentalDisabledError(feature)
+				}
 			}
 			store := session.NewFileStore(resolveSessionFile(opts))
 			sess, _ := store.Load(cmd.Context())
@@ -132,6 +143,7 @@ func newRootCmd() *cobra.Command {
 	)
 	cmd.PersistentFlags().String("lang", "", "UI language for help, prompts, and table output: en|ko (also TOSSCTL_LANG / LANG)")
 
+	paperCmd := newPaperCmd(opts)
 	cmd.AddCommand(
 		newInitCmd(opts),
 		newVersionCmd(opts),
@@ -142,6 +154,7 @@ func newRootCmd() *cobra.Command {
 		newOpenAPICmd(opts),
 		newAccountCmd(opts),
 		newPortfolioCmd(opts),
+		newBankingCmd(opts),
 		newLendingCmd(opts),
 		newAccumulateCmd(opts),
 		newProfitCmd(opts),
@@ -154,15 +167,71 @@ func newRootCmd() *cobra.Command {
 		newMarketCmd(opts),
 		newCommunityCmd(opts),
 		newOrderCmd(opts),
+		paperCmd,
 		newExportCmd(opts),
 		newPushCmd(opts),
+		newNotificationsCmd(opts),
 		newStreamCmd(opts),
 		newMonitorCmd(opts),
 		newMCPCmd(opts),
 		newOpsCmd(opts),
 	)
 
+	// Experimental commands remain addressable so an opted-out invocation can
+	// explain how to enable them, but do not appear in help discovery until the
+	// user's config explicitly opts in.
+	defaultHelp := cmd.HelpFunc()
+	cmd.SetHelpFunc(func(c *cobra.Command, args []string) {
+		enabled, err := experimentEnabled(opts, featuregate.PaperTrading)
+		paperCmd.Hidden = err != nil || !enabled
+		if commandExperiment(c) == featuregate.PaperTrading && !enabled {
+			if err != nil {
+				fmt.Fprintln(c.ErrOrStderr(), err)
+				return
+			}
+			fmt.Fprintln(c.ErrOrStderr(), experimentalDisabledError(featuregate.PaperTrading))
+			return
+		}
+		defaultHelp(c, args)
+	})
+
 	return cmd
+}
+
+func commandExperiment(cmd *cobra.Command) string {
+	for current := cmd; current != nil; current = current.Parent() {
+		if feature := current.Annotations["experimental"]; feature != "" {
+			return feature
+		}
+	}
+	return ""
+}
+
+func enabledExperiments(cfg config.File) []string {
+	if cfg.Experimental.PaperTrading {
+		return []string{featuregate.PaperTrading}
+	}
+	return nil
+}
+
+func experimentEnabled(opts *rootOptions, feature string) (bool, error) {
+	cfg, err := loadConfig(opts)
+	if err != nil {
+		return false, err
+	}
+	for _, enabled := range enabledExperiments(cfg) {
+		if enabled == feature {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func experimentalDisabledError(feature string) error {
+	if feature == featuregate.PaperTrading {
+		return fmt.Errorf("experimental feature %q is disabled; run `tossctl config experimental paper-trading --enable` to opt in", feature)
+	}
+	return fmt.Errorf("experimental feature %q is disabled", feature)
 }
 
 // resolveSessionFile mirrors the resolution done in newAppContext but without
@@ -392,7 +461,7 @@ func updateActionHint(currentVersion string) string {
 		execPath = resolved
 	}
 	if selfupdate.DetectInstallMethod(execPath, currentVersion) == selfupdate.MethodHomebrew {
-		return "`brew upgrade tossctl-cli` or " + version.ReleasesLatestURL
+		return "`brew upgrade tossctl` or " + version.ReleasesLatestURL
 	}
 	return "`tossctl update` or " + version.ReleasesLatestURL
 }
@@ -450,14 +519,17 @@ func configFilePath(opts *rootOptions) (string, error) {
 // resolveBackend returns the effective routing backend preference.
 // The --backend flag takes precedence over cfg.Prefer.
 // An empty flag means "use config". Invalid flag values are rejected.
-func resolveBackend(cfg config.OpenAPI, flag string) (string, error) {
-	if flag == "" {
-		return cfg.Prefer, nil
+func resolveBackend(cfg config.OpenAPI, flag string) (routing.Preference, error) {
+	value := flag
+	source := "--backend"
+	if value == "" {
+		value = string(cfg.Prefer)
+		source = "openapi.prefer"
 	}
-	if norm, ok := config.NormalizeBackend(flag); ok {
-		return norm, nil
+	if prefer, ok := routing.ParsePreference(value); ok {
+		return prefer, nil
 	}
-	return "", fmt.Errorf("invalid --backend value %q: must be one of auto, wts, openapi", flag)
+	return "", fmt.Errorf("invalid %s value %q: must be one of auto, wts, openapi", source, value)
 }
 
 func humanizeDuration(d time.Duration) string {
@@ -534,7 +606,7 @@ func newAppContext(opts *rootOptions) (*appContext, error) {
 	}
 
 	var off *official.Client
-	if creds != nil && cfg.OpenAPI.Enabled && prefer != "wts" {
+	if creds != nil && cfg.OpenAPI.Enabled && prefer != routing.WTS {
 		off = official.New(*creds, tokenFile)
 	}
 
@@ -558,6 +630,8 @@ func newAppContext(opts *rootOptions) (*appContext, error) {
 		lineageService: lineage,
 		// The trading service records lineage itself, so every surface that
 		// mutates through it (cobra, MCP, `ops call`) leaves the same trail.
-		tradingService: trading.NewService(cfg.Trading, h.Broker()).WithLineage(lineage),
+		tradingService: trading.NewService(cfg.Trading, h.Broker()).
+			WithConditionalBroker(h).
+			WithLineage(lineage),
 	}, nil
 }

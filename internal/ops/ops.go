@@ -10,8 +10,8 @@
 // A probe deliberately bypasses the typed client (raw method/URL/body plus a
 // schema invariant) so that server-side contract changes are caught even when
 // the client code is in lockstep — see the #29 regression. Probes are curated,
-// not mandatory: one representative endpoint per CLI surface (Probe stays nil
-// on the rest to keep the live-API cron cheap and quiet).
+// not mandatory; aggregate operations may declare extra dependency probes while
+// already-covered surfaces leave Probe nil to keep the live-API cron quiet.
 //
 // ponytail: operations are hand-registered. When the official OpenAPI surface
 // stabilises further, this registry is the natural seam to generate directly
@@ -29,30 +29,44 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JungHoonGhae/tossinvest-cli/internal/hiddenholding"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/hybrid"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/jsoninput"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/official"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/openapiip"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/papertrading"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/pricealert"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/trading"
+	watchlistservice "github.com/JungHoonGhae/tossinvest-cli/internal/watchlist"
 )
 
 // Deps carries the backends a handler may need. Official-only read operations
 // use Client; WTS reads and "auto" reads use WTS; write (order-mutation)
-// operations go through Trading, which applies the config gate, dry-run
+// order operations go through Trading, which applies the config gate, dry-run
 // preview, and confirm-token flow — the same policy the `tossctl order` CLI
-// enforces. Trading routes to an official-only broker, so order writes never
-// touch a WTS session. Client and WTS are each optional (nil when that
+// enforces. Non-trading Open API allowlist changes go through OpenAPIIP, which
+// owns its own preview/confirm/rollback transaction. Trading routes to an
+// official-only broker, so order writes never touch a WTS session. Client and
+// WTS are each optional (nil when that
 // credential/session is absent); Catalog.Call checks the one an operation
-// needs and returns a clear "run login" error when it is missing.
+// needs and returns a clear "run login" error when it is missing. Non-trading
+// writes are routed through dedicated services that own the same
+// preview/confirm/post-read boundary.
 //
 // WTS is the hybrid router rather than the bare web-session client, so agents
 // get the same official→WTS fallback the CLI has always had (see
 // internal/hybrid). With no official credentials the router degrades to a pure
 // WTS passthrough, which is exactly the pre-hybrid behaviour.
 type Deps struct {
-	Client  *official.Client
-	WTS     *hybrid.Client
-	Trading *trading.Service
-	Auth    AuthStatus
+	Client         *official.Client
+	WTS            *hybrid.Client
+	Trading        *trading.Service
+	OpenAPIIP      *openapiip.Service
+	PriceAlerts    *pricealert.Service
+	HiddenHoldings *hiddenholding.Service
+	Watchlists     *watchlistservice.Service
+	Paper          *papertrading.Service
+	Auth           AuthStatus
 }
 
 // BackendStatus reports whether a backend is connected and, if known, when its
@@ -79,27 +93,132 @@ type Param struct {
 	Desc     string `json:"description,omitempty"`
 }
 
+type MutationRiskLevel string
+type MutationReversibility string
+type MutationAuthorizationMode string
+
+const (
+	MutationRiskPreference  MutationRiskLevel = "preference"
+	MutationRiskDestructive MutationRiskLevel = "destructive"
+	MutationRiskFinancial   MutationRiskLevel = "financial"
+	MutationRiskSimulation  MutationRiskLevel = "simulation"
+
+	MutationReversible   MutationReversibility = "reversible"
+	MutationCompensating MutationReversibility = "compensating"
+	MutationIrreversible MutationReversibility = "irreversible"
+	MutationUnknown      MutationReversibility = "unknown"
+
+	// Intent confirmation binds an exact mutation intent but does not imply
+	// expiry or replay prevention. State confirmation additionally binds the
+	// current server state; applying the change normally invalidates that token.
+	// Bounded mandates are reserved for future automation operations whose
+	// scope, limits, expiry, and kill switch are validated by a dedicated module.
+	MutationAuthorizationIntent     MutationAuthorizationMode = "intent_confirmation"
+	MutationAuthorizationState      MutationAuthorizationMode = "state_confirmation"
+	MutationAuthorizationMandate    MutationAuthorizationMode = "bounded_mandate"
+	MutationAuthorizationSimulation MutationAuthorizationMode = "simulation_execute"
+)
+
+// MutationPolicy makes every callable write's safety contract discoverable by
+// how strong the guard must be and what can (or cannot) undo the action.
+type MutationPolicy struct {
+	RiskLevel         MutationRiskLevel         `json:"risk_level"`
+	Reversibility     MutationReversibility     `json:"reversibility"`
+	AuthorizationMode MutationAuthorizationMode `json:"authorization_mode"`
+	RequiresPreview   bool                      `json:"requires_preview"`
+	// Fresh means the token binds a current server-state snapshot. It does not
+	// by itself promise one-time consumption; expiring operations say so explicitly.
+	RequiresFreshConfirmation           bool   `json:"requires_fresh_confirmation"`
+	RequiresConfigOptIn                 bool   `json:"requires_config_opt_in"`
+	RequiresIrreversibleAcknowledgement bool   `json:"requires_irreversible_acknowledgement"`
+	Verification                        string `json:"verification"`
+}
+
+func reversiblePreferenceMutation(verification string) *MutationPolicy {
+	return &MutationPolicy{
+		RiskLevel: MutationRiskPreference, Reversibility: MutationReversible,
+		AuthorizationMode: MutationAuthorizationState,
+		RequiresPreview:   true, RequiresFreshConfirmation: true, Verification: verification,
+	}
+}
+
+func compensatingPreferenceMutation(verification string) *MutationPolicy {
+	return &MutationPolicy{
+		RiskLevel: MutationRiskPreference, Reversibility: MutationCompensating,
+		AuthorizationMode: MutationAuthorizationState,
+		RequiresPreview:   true, RequiresFreshConfirmation: true, Verification: verification,
+	}
+}
+
+func financialMutation(verification string) *MutationPolicy {
+	return &MutationPolicy{
+		RiskLevel: MutationRiskFinancial, Reversibility: MutationIrreversible,
+		AuthorizationMode: MutationAuthorizationIntent,
+		RequiresPreview:   true, RequiresFreshConfirmation: false, RequiresConfigOptIn: true,
+		Verification: verification,
+	}
+}
+
+func destructiveMutation(verification string) *MutationPolicy {
+	return &MutationPolicy{
+		RiskLevel: MutationRiskDestructive, Reversibility: MutationIrreversible,
+		AuthorizationMode: MutationAuthorizationState,
+		RequiresPreview:   true, RequiresFreshConfirmation: true,
+		RequiresIrreversibleAcknowledgement: true, Verification: verification,
+	}
+}
+
+func simulationMutation(reversibility MutationReversibility, verification string) *MutationPolicy {
+	return &MutationPolicy{
+		RiskLevel: MutationRiskSimulation, Reversibility: reversibility,
+		AuthorizationMode: MutationAuthorizationSimulation,
+		RequiresPreview:   true, Verification: verification,
+	}
+}
+
 // ProbeSpec declares the health probe for an operation: a raw HTTP request
 // (bypassing the typed client on purpose) plus the smallest schema invariant
 // that catches a contract change without false-positiving on unrelated fields.
 type ProbeSpec struct {
-	Name   string // probe name (stable; may differ from the operation ID)
-	Method string
-	URL    string
-	Body   string
-	Check  func(status int, body []byte) error
+	Name          string // probe name (stable; may differ from the operation ID)
+	Method        string
+	URL           string
+	Body          string
+	AccountScoped bool // inject the primary Securities accountKey header at runtime
+	// WatchlistGroupScoped replaces {watchlistGroupId} with an ID read from
+	// the authenticated user's watchlist-groups probe.
+	WatchlistGroupScoped bool
+	Check                func(status int, body []byte) error
 }
 
 // Operation is one callable API operation in the registry.
 type Operation struct {
-	ID       string `json:"id"`
-	Method   string `json:"method"`
-	Path     string `json:"path"`
-	Category string `json:"category"`
-	Summary  string `json:"summary"`
-	// Write marks state-changing operations (order place/cancel/modify). They
-	// are gated by config and require an explicit execute + confirm token.
+	ID string `json:"id"`
+	// Aliases are accepted for backward compatibility but are not separate
+	// operations. Discovery returns the canonical ID so terminology can improve
+	// without duplicating handlers, probes, or operation counts.
+	Aliases []string `json:"aliases,omitempty"`
+	Method  string   `json:"method"`
+	Path    string   `json:"path"`
+	// Domain is the product area and stays independent of Backend, the access
+	// channel. For example, a Securities operation can use official or WTS.
+	Domain string `json:"domain"`
+	// Environment distinguishes isolated simulation ledgers from the ordinary
+	// production account surface. It is explicit on paper operations.
+	Environment string `json:"environment,omitempty"`
+	// Experimental names the opt-in feature gate for a rolling operation. An
+	// empty value means the operation is part of the stable catalog.
+	Experimental string `json:"experimental,omitempty"`
+	Category     string `json:"category"`
+	Summary      string `json:"summary"`
+	// Write marks state-changing operations. Live and preference writes require
+	// execute plus a confirmation token; isolated simulation_execute writes require
+	// execute without conferring live authority. Future mandate-driven operations
+	// must declare bounded_mandate instead of pretending confirmation was bypassed.
 	Write bool `json:"write"`
+	// Mutation is present for every Write operation and absent for reads. It is
+	// deliberately explicit so agents do not infer safety from HTTP verbs.
+	Mutation *MutationPolicy `json:"mutation,omitempty"`
 	// Backend selects which authenticated client the operation needs: "" (default)
 	// = the official Open API client; "wts" = the web-session client; "auto" =
 	// either one, because the hybrid router serves it (tries official, falls back
@@ -107,29 +226,69 @@ type Operation struct {
 	// dispatching.
 	Backend string  `json:"backend,omitempty"`
 	Params  []Param `json:"params"`
-	// Probe, when set, is the monitoring spec derived by internal/monitor.
+	// Probe, when set, is the primary monitoring spec derived by internal/monitor.
 	// Curated — nil on operations whose surface is already covered.
 	Probe *ProbeSpec `json:"-"`
+	// ExtraProbes cover additional HTTP dependencies of aggregate operations.
+	// They are kept out of the public operation schema just like Probe.
+	ExtraProbes []ProbeSpec `json:"-"`
+	// ProbeRefs name shared probe specs used by more than one operation. The
+	// shared request runs once even when several operations depend on it.
+	ProbeRefs []string `json:"-"`
 	// handler executes the operation against the given backends.
 	handler func(ctx context.Context, d *Deps, args map[string]any) (any, error)
 }
 
-// Catalog is the immutable registry of operations, indexed by ID.
-type Catalog struct {
-	ops  []Operation
-	byID map[string]Operation
+// OperationListItem is the compact discovery shape shared by the CLI and MCP
+// adapters. Keeping the projection beside Operation prevents the two machine
+// surfaces from drifting when aliases or mutation policy fields evolve.
+type OperationListItem struct {
+	ID           string   `json:"id"`
+	Aliases      []string `json:"aliases,omitempty"`
+	Domain       string   `json:"domain"`
+	Environment  string   `json:"environment,omitempty"`
+	Experimental string   `json:"experimental,omitempty"`
+	Category     string   `json:"category"`
+	Summary      string   `json:"summary"`
+	Write        bool     `json:"write,omitempty"`
+	Backend      string   `json:"backend,omitempty"`
+	Required     []string `json:"required,omitempty"`
 }
 
-// NewCatalog builds the operation catalog (official reads, gated order-mutation
-// writes, and WTS-only reads).
-func NewCatalog() *Catalog {
+// Catalog is the immutable registry of operations, indexed by ID.
+type Catalog struct {
+	ops                []Operation
+	byID               map[string]Operation
+	enabledExperiments map[string]bool
+}
+
+// NewCatalog builds the operation catalog (official reads, WTS reads, gated
+// order mutations, and gated non-trading settings mutations).
+func NewCatalog(enabledExperiments ...string) *Catalog {
 	ops := append(readOperations(), writeOperations()...)
 	ops = append(ops, wtsOperations()...)
+	ops = append(ops, settingsOperations()...)
+	ops = append(ops, paperOperations()...)
 	byID := make(map[string]Operation, len(ops))
-	for _, o := range ops {
+	for i := range ops {
+		if ops[i].Domain == "" {
+			ops[i].Domain = "securities"
+		}
+		o := ops[i]
 		byID[o.ID] = o
+		for _, alias := range o.Aliases {
+			byID[alias] = o
+		}
 	}
-	return &Catalog{ops: ops, byID: byID}
+	enabled := make(map[string]bool, len(enabledExperiments))
+	for _, experiment := range enabledExperiments {
+		enabled[experiment] = true
+	}
+	return &Catalog{ops: ops, byID: byID, enabledExperiments: enabled}
+}
+
+func (c *Catalog) visible(o Operation) bool {
+	return o.Experimental == "" || c.enabledExperiments[o.Experimental]
 }
 
 // List returns operations whose searchable text contains query (case-insensitive).
@@ -142,8 +301,11 @@ func (c *Catalog) List(query string, limit int) []Operation {
 	q := strings.ToLower(strings.TrimSpace(query))
 	out := make([]Operation, 0, len(c.ops))
 	for _, o := range c.ops {
+		if !c.visible(o) {
+			continue
+		}
 		if q != "" {
-			hay := strings.ToLower(o.ID + " " + o.Path + " " + o.Category + " " + o.Summary)
+			hay := strings.ToLower(o.ID + " " + strings.Join(o.Aliases, " ") + " " + o.Path + " " + o.Domain + " " + o.Environment + " " + o.Experimental + " " + o.Category + " " + o.Summary)
 			if !strings.Contains(hay, q) {
 				continue
 			}
@@ -156,18 +318,61 @@ func (c *Catalog) List(query string, limit int) []Operation {
 	return out
 }
 
+// ListItems returns the compact, adapter-independent discovery projection.
+func (c *Catalog) ListItems(query string, limit int) []OperationListItem {
+	operations := c.List(query, limit)
+	items := make([]OperationListItem, 0, len(operations))
+	for _, operation := range operations {
+		items = append(items, OperationListItem{
+			ID: operation.ID, Aliases: operation.Aliases,
+			Domain: operation.Domain, Environment: operation.Environment, Experimental: operation.Experimental, Category: operation.Category,
+			Summary: operation.Summary, Write: operation.Write,
+			Backend: operation.Backend, Required: operation.RequiredNames(),
+		})
+	}
+	return items
+}
+
+// Count returns the complete registry size without applying List's public
+// response cap. Use it for runtime-derived documentation and health checks.
+func (c *Catalog) Count() int {
+	if c == nil {
+		return 0
+	}
+	count := 0
+	for _, operation := range c.ops {
+		if c.visible(operation) {
+			count++
+		}
+	}
+	return count
+}
+
 // Get returns the operation with the given ID.
 func (c *Catalog) Get(id string) (Operation, bool) {
 	o, ok := c.byID[id]
-	return o, ok
+	return o, ok && c.visible(o)
 }
 
 // Probes returns the probe specs declared by registry entries, in catalog order.
 func (c *Catalog) Probes() []ProbeSpec {
 	var out []ProbeSpec
+	referenced := make(map[string]bool)
 	for _, o := range c.ops {
+		if !c.visible(o) {
+			continue
+		}
 		if o.Probe != nil {
 			out = append(out, *o.Probe)
+		}
+		out = append(out, o.ExtraProbes...)
+		for _, name := range o.ProbeRefs {
+			referenced[name] = true
+		}
+	}
+	for _, probe := range sharedWTSProbes() {
+		if referenced[probe.Name] {
+			out = append(out, probe)
 		}
 	}
 	return out
@@ -180,6 +385,9 @@ func (c *Catalog) Call(ctx context.Context, deps *Deps, id string, args map[stri
 	op, ok := c.byID[id]
 	if !ok {
 		return nil, fmt.Errorf("unknown operation %q (use list_operations to discover valid ids)", id)
+	}
+	if !c.visible(op) {
+		return nil, fmt.Errorf("operation %q is experimental; opt in to %q before using it", id, op.Experimental)
 	}
 	validated, err := validateArguments(op, args)
 	if err != nil {
@@ -372,9 +580,9 @@ func ExpectStatus(got, want int) error {
 	return fmt.Errorf("status %d (want %d)", got, want)
 }
 
-// ExpectPath walks a dotted JSON path (a.b.c) and asserts the value's type.
+// ExpectPath walks a dotted JSON path (a.b.0.c) and asserts the value's type.
 // Supported types: "string", "number", "bool", "object", "array", "null".
-// Array indexing not supported — for nested-array checks, use a custom Check.
+// Numeric segments index arrays; error messages never include response values.
 // (moved verbatim from internal/monitor.)
 func ExpectPath(body []byte, path, wantType string) error {
 	var v any

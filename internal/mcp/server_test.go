@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -12,7 +13,10 @@ import (
 
 	tossclient "github.com/JungHoonGhae/tossinvest-cli/internal/client"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/config"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/hybrid"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/official"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/openapiip"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/ops"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/session"
 	"github.com/JungHoonGhae/tossinvest-cli/internal/trading"
 )
@@ -31,7 +35,7 @@ func runServerPolicy(t *testing.T, client *official.Client, policy config.Tradin
 	in := strings.NewReader(strings.Join(lines, "\n") + "\n")
 	var out bytes.Buffer
 	tradingSvc := trading.NewService(policy, OfficialBroker{Client: client})
-	s := NewServer(client, nil, tradingSvc, "test", "0.0.0")
+	s := NewServer(client, nil, Services{Trading: tradingSvc}, "test", "0.0.0")
 	if err := s.Serve(context.Background(), in, &out); err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
@@ -133,7 +137,19 @@ func TestToolsListExposesThreeCatalogTools(t *testing.T) {
 	tools := resultOf(t, resps[0])["tools"].([]any)
 	got := map[string]bool{}
 	for _, tl := range tools {
-		got[tl.(map[string]any)["name"].(string)] = true
+		definition := tl.(map[string]any)
+		name := definition["name"].(string)
+		description := definition["description"].(string)
+		got[name] = true
+		if name == "list_operations" && !strings.Contains(description, "mutation policy") {
+			t.Error("list_operations description must tell agents where write authorization policy lives")
+		}
+		if name == "list_operations" && (!strings.Contains(description, "environment") || !strings.Contains(description, "experimental")) {
+			t.Error("list_operations description must explain paper-environment and experimental discovery fields")
+		}
+		if name == "call_operation" && (!strings.Contains(description, "simulation_execute") || !strings.Contains(description, "never authorizes a live order")) {
+			t.Error("call_operation description must distinguish simulation execution from live confirmation")
+		}
 	}
 	for _, want := range []string{"list_operations", "describe_operation", "call_operation"} {
 		if !got[want] {
@@ -165,6 +181,31 @@ func TestListOperationsFiltersByQuery(t *testing.T) {
 	}
 	if payload.Count != 1 || payload.Operations[0].ID != "orderbook" {
 		t.Fatalf("query orderbook: got %+v", payload)
+	}
+}
+
+func TestListOperationsFindsLegacyAliasButReturnsCanonicalID(t *testing.T) {
+	c := dummyClient(t, nil)
+	resps := runServer(t, c,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_operations","arguments":{"query":"banking_status"}}}`,
+	)
+	text, isErr := toolText(t, resps[0])
+	if isErr {
+		t.Fatalf("unexpected error result: %s", text)
+	}
+	var payload struct {
+		Count      int `json:"count"`
+		Operations []struct {
+			ID      string   `json:"id"`
+			Aliases []string `json:"aliases"`
+		} `json:"operations"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Count != 1 || payload.Operations[0].ID != "accumulation_funding_status" ||
+		len(payload.Operations[0].Aliases) != 1 || payload.Operations[0].Aliases[0] != "banking_status" {
+		t.Fatalf("alias query payload = %+v", payload)
 	}
 }
 
@@ -254,23 +295,97 @@ func TestListOperationsRejectsNullQuery(t *testing.T) {
 	}
 }
 
-func TestListOperationsIncludesGatedWrites(t *testing.T) {
+func TestListOperationsKeepsWriteDetailsInDescribe(t *testing.T) {
 	c := dummyClient(t, nil)
 	resps := runServer(t, c,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_operations","arguments":{"query":"place_order"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_operation","arguments":{"operation":"place_order"}}}`,
 	)
 	text, _ := toolText(t, resps[0])
 	var payload struct {
-		Operations []struct {
-			ID    string `json:"id"`
-			Write bool   `json:"write"`
-		} `json:"operations"`
+		Operations []map[string]any `json:"operations"`
 	}
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Operations) != 1 || !payload.Operations[0].Write {
-		t.Fatalf("place_order should be listed as a write op: %+v", payload.Operations)
+	if len(payload.Operations) != 1 || payload.Operations[0]["write"] != true {
+		t.Fatalf("place_order should be listed as a write op: %s", text)
+	}
+	for _, detail := range []string{"method", "path", "mutation"} {
+		if _, exists := payload.Operations[0][detail]; exists {
+			t.Fatalf("%s belongs in describe_operation, not list_operations: %s", detail, text)
+		}
+	}
+
+	described, isErr := toolText(t, resps[1])
+	if isErr {
+		t.Fatalf("describe_operation failed: %s", described)
+	}
+	var operation struct {
+		Method   string              `json:"method"`
+		Path     string              `json:"path"`
+		Mutation *ops.MutationPolicy `json:"mutation"`
+	}
+	if err := json.Unmarshal([]byte(described), &operation); err != nil {
+		t.Fatal(err)
+	}
+	if operation.Method == "" || operation.Path == "" || operation.Mutation == nil ||
+		operation.Mutation.RiskLevel != ops.MutationRiskFinancial ||
+		operation.Mutation.AuthorizationMode != ops.MutationAuthorizationIntent ||
+		operation.Mutation.RequiresFreshConfirmation {
+		t.Fatalf("describe_operation lost write policy: %s", described)
+	}
+}
+
+func TestUnfilteredListOperationsFitsWithoutOmission(t *testing.T) {
+	c := dummyClient(t, nil)
+	resps := runServer(t, c,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_operations","arguments":{}}}`,
+	)
+	text, isErr := toolText(t, resps[0])
+	if isErr {
+		t.Fatalf("list_operations failed: %s", text)
+	}
+	var payload struct {
+		Count      int              `json:"count"`
+		Operations []map[string]any `json:"operations"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Count != NewCatalog().Count() || len(payload.Operations) != payload.Count {
+		t.Fatalf("catalog was truncated: count=%d operations=%d bytes=%d", payload.Count, len(payload.Operations), len(text))
+	}
+	if strings.Contains(text, omittedKey) || len(text) > maxResultBytes {
+		t.Fatalf("catalog should fit without omission: bytes=%d", len(text))
+	}
+}
+
+func TestPaperOperationsRequireMCPExperimentOptIn(t *testing.T) {
+	t.Parallel()
+	stable := NewServer(nil, nil, Services{}, "test", "0.0.0")
+	if _, ok := stable.catalog.Get("get_paper_trading_status"); ok {
+		t.Fatal("paper operation leaked into default MCP catalog")
+	}
+	enabled := NewServer(nil, nil, Services{Experiments: []string{"paper-trading"}}, "test", "0.0.0")
+	op, ok := enabled.catalog.Get("get_paper_trading_status")
+	if !ok || op.Experimental != "paper-trading" {
+		t.Fatalf("enabled MCP operation = %#v, found=%v", op, ok)
+	}
+	stableInstructions := strings.ToLower(stable.instructions)
+	enabledInstructions := strings.ToLower(enabled.instructions)
+	if strings.Contains(stableInstructions, "isolated paper") || !strings.Contains(enabledInstructions, "isolated paper") {
+		t.Fatalf("instructions did not follow experiment gate: stable=%q enabled=%q", stable.instructions, enabled.instructions)
+	}
+}
+
+func TestNewServerWiresOpenAPIIPManager(t *testing.T) {
+	t.Parallel()
+	routed := hybrid.New(tossclient.New(tossclient.Config{}), nil, hybrid.Policy{}, io.Discard)
+	manager := openapiip.NewService(nil, nil)
+	server := NewServer(nil, routed, Services{OpenAPIIP: manager}, "test", "0.0.0")
+	if server.deps.OpenAPIIP != manager {
+		t.Fatal("MCP server must preserve the injected Open API IP manager")
 	}
 }
 
@@ -297,6 +412,43 @@ func TestPlaceOrderPreviewDoesNotExecute(t *testing.T) {
 	}
 	if preview.MutationReady {
 		t.Errorf("mutation_ready must be false when config disables trading")
+	}
+}
+
+func TestConditionalOrderOperationsAreVisibleAndPreviewable(t *testing.T) {
+	c := dummyClient(t, nil)
+	resps := runServer(t, c,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_operations","arguments":{"query":"conditional"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"call_operation","arguments":{"operation":"place_conditional_order","params":{"symbol":"005930","quantity":1,"expire_date":"2026-12-31","first_side":"BUY","first_trigger":70000,"first_order_price":69900}}}}`,
+	)
+
+	listText, listErr := toolText(t, resps[0])
+	if listErr {
+		t.Fatalf("list conditional operations: %s", listText)
+	}
+	var listed struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal([]byte(listText), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Count != 5 {
+		t.Fatalf("conditional operation count = %d, want 5: %s", listed.Count, listText)
+	}
+
+	previewText, previewErr := toolText(t, resps[1])
+	if previewErr {
+		t.Fatalf("conditional preview: %s", previewText)
+	}
+	var preview struct {
+		Kind         string `json:"kind"`
+		ConfirmToken string `json:"confirm_token"`
+	}
+	if err := json.Unmarshal([]byte(previewText), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.Kind != "conditional_place" || preview.ConfirmToken == "" {
+		t.Fatalf("unexpected conditional preview: %s", previewText)
 	}
 }
 
@@ -415,7 +567,7 @@ func TestToolResultCapsOversizedPayload(t *testing.T) {
 	defer srv.Close()
 
 	wts := tossclient.New(tossclient.Config{
-		InfoBaseURL: srv.URL,
+		CertBaseURL: srv.URL,
 		Session:     &session.Session{Cookies: map[string]string{"SESSION": "s"}},
 	})
 	resps := driveWTS(t, wts,
@@ -478,6 +630,18 @@ func TestToolResultPreservesLargeIntegerWhenTrimming(t *testing.T) {
 	}
 	if !strings.Contains(got, omittedKey) {
 		t.Fatalf("test payload did not exercise trimming: %s", got[:min(len(got), 300)])
+	}
+}
+
+func TestKeepableDoesNotTrustUpstreamOmissionLikeMap(t *testing.T) {
+	t.Parallel()
+	rows := []any{map[string]any{omittedKey: 999, "value": "upstream data"}}
+	if got := keepable(rows); got != 1 {
+		t.Fatalf("upstream map was mistaken for a private omission marker: got %d", got)
+	}
+	rows = append(rows, omittedItems{Count: 1, Note: "transport marker"})
+	if got := keepable(rows); got != 1 {
+		t.Fatalf("private omission marker was not recognized: got %d", got)
 	}
 }
 

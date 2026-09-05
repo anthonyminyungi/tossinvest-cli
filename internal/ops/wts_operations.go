@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tossclient "github.com/JungHoonGhae/tossinvest-cli/internal/client"
+	"github.com/JungHoonGhae/tossinvest-cli/internal/privacy"
 )
 
 // Probe hosts — raw URLs on purpose (probes bypass the typed client so a
@@ -20,12 +21,241 @@ const (
 	probeInfo = "https://wts-info-api.tossinvest.com"
 )
 
-func statusAndPath(path, typ string) func(int, []byte) error {
+// sharedWTSProbes are runtime dependencies reused by multiple operations.
+// Operations point at these names through ProbeRefs so the dependency graph is
+// explicit without issuing the same health-check request more than once.
+func sharedWTSProbes() []ProbeSpec {
+	return []ProbeSpec{
+		{
+			Name:   "account-list",
+			Method: "GET",
+			URL:    probeAPI + "/api/v1/account/list",
+			Check:  statusAndPath("result.accountList", "array"),
+		},
+		{
+			Name:   "notification-settings",
+			Method: "GET",
+			URL:    probeCert + "/api/v1/user-alimies",
+			Check:  statusAndNotificationSettings(),
+		},
+		{
+			Name: "stock-search", Method: "POST",
+			URL: probeInfo + "/api/v2/search/stocks", Body: `{"query":"AAPL"}`,
+			Check: statusAndPath("result.stocks", "array"),
+		},
+		{
+			Name: "watchlist-group", Method: "GET",
+			URL:                  probeCert + "/api/v1/new-watchlists/groups?ids={watchlistGroupId}&includePrice=true",
+			WatchlistGroupScoped: true,
+			Check:                statusAndWatchlistGroup(),
+		},
+	}
+}
+
+func statusAndWatchlistGroup() func(int, []byte) error {
+	return statusAndWatchlistFolders(true)
+}
+
+func statusAndWatchlistFolders(requireFolder bool) func(int, []byte) error {
 	return func(status int, body []byte) error {
 		if err := ExpectStatus(status, 200); err != nil {
 			return err
 		}
-		return ExpectPath(body, path, typ)
+		if err := ExpectPath(body, "result.watchlists", "array"); err != nil {
+			return err
+		}
+		var envelope struct {
+			Result struct {
+				Watchlists []struct {
+					ID        *int64          `json:"id"`
+					ItemCount *int            `json:"itemCount"`
+					Items     json.RawMessage `json:"items"`
+				} `json:"watchlists"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			return fmt.Errorf("decode watchlist folder: %v", err)
+		}
+		if requireFolder && len(envelope.Result.Watchlists) == 0 {
+			return fmt.Errorf("result.watchlists must contain the requested folder")
+		}
+		for _, group := range envelope.Result.Watchlists {
+			if group.ID == nil || *group.ID <= 0 {
+				return fmt.Errorf("watchlist folder is missing a positive numeric id")
+			}
+			if group.ItemCount == nil || *group.ItemCount < 0 {
+				return fmt.Errorf("watchlist folder %d is missing a valid itemCount", *group.ID)
+			}
+			var items []struct {
+				Code string `json:"code"`
+			}
+			if len(group.Items) == 0 || string(group.Items) == "null" || json.Unmarshal(group.Items, &items) != nil || items == nil {
+				return fmt.Errorf("watchlist folder %d is missing its items array", *group.ID)
+			}
+			if *group.ItemCount != len(items) {
+				return fmt.Errorf("watchlist folder %d itemCount=%d but items has %d entries", *group.ID, *group.ItemCount, len(items))
+			}
+			for _, item := range items {
+				if strings.TrimSpace(item.Code) == "" {
+					return fmt.Errorf("watchlist folder %d contains an item without a product code", *group.ID)
+				}
+			}
+		}
+		return nil
+	}
+}
+
+func statusAndWatchlistGroupsSimple() func(int, []byte) error {
+	return func(status int, body []byte) error {
+		if err := ExpectStatus(status, 200); err != nil {
+			return err
+		}
+		if err := ExpectPath(body, "result.watchlists", "array"); err != nil {
+			return err
+		}
+		var envelope struct {
+			Result struct {
+				Watchlists []struct {
+					ID        *int64 `json:"id"`
+					ItemCount *int   `json:"itemCount"`
+				} `json:"watchlists"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			return fmt.Errorf("decode watchlist folders: %v", err)
+		}
+		for _, group := range envelope.Result.Watchlists {
+			if group.ID == nil || *group.ID <= 0 || group.ItemCount == nil || *group.ItemCount < 0 {
+				return fmt.Errorf("watchlist folder metadata requires a positive id and non-negative itemCount")
+			}
+		}
+		return nil
+	}
+}
+
+func statusAndNotificationSettings() func(int, []byte) error {
+	return func(status int, body []byte) error {
+		if err := ExpectStatus(status, 200); err != nil {
+			return err
+		}
+		if err := ExpectPath(body, "result", "array"); err != nil {
+			return err
+		}
+		var env struct {
+			Result []struct {
+				Type    *string `json:"type"`
+				Enabled *bool   `json:"enabled"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil {
+			return fmt.Errorf("decode notification settings: %v", err)
+		}
+		seen := map[string]bool{}
+		for index, setting := range env.Result {
+			if setting.Enabled == nil {
+				return fmt.Errorf("result[%d] requires enabled boolean", index)
+			}
+			if setting.Type == nil || strings.TrimSpace(*setting.Type) == "" {
+				continue
+			}
+			seen[*setting.Type] = true
+		}
+		var missing []string
+		for _, required := range []string{"AI_ISSUE_SNS_RELEASE", "FOMC_LIVE", "REASONING_SUBSCRIPTION"} {
+			if !seen[required] {
+				missing = append(missing, required)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("result missing required notification types: %s", strings.Join(missing, ", "))
+		}
+		return nil
+	}
+}
+
+func statusAndPath(path, typ string) func(int, []byte) error {
+	return statusAndPaths([2]string{path, typ})
+}
+
+func statusAndPaths(expected ...[2]string) func(int, []byte) error {
+	return func(status int, body []byte) error {
+		if err := ExpectStatus(status, 200); err != nil {
+			return err
+		}
+		for _, item := range expected {
+			if err := ExpectPath(body, item[0], item[1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func statusAndCursorPage() func(int, []byte) error {
+	return func(status int, body []byte) error {
+		if err := ExpectStatus(status, 200); err != nil {
+			return err
+		}
+		if err := ExpectPath(body, "result.body", "array"); err != nil {
+			return err
+		}
+		if err := ExpectPath(body, "result.nextCursorKey", "string"); err == nil {
+			return nil
+		}
+		return ExpectPath(body, "result.nextCursorKey", "null")
+	}
+}
+
+func statusAndOptionalArrayItemPaths(expected ...[2]string) func(int, []byte) error {
+	return func(status int, body []byte) error {
+		if err := ExpectStatus(status, 200); err != nil {
+			return err
+		}
+		if err := ExpectPath(body, "result", "array"); err != nil {
+			return err
+		}
+		var envelope struct {
+			Result []json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			return fmt.Errorf("decode result array: %v", err)
+		}
+		if len(envelope.Result) == 0 {
+			return nil
+		}
+		for _, item := range expected {
+			if err := ExpectPath(envelope.Result[0], item[0], item[1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func statusAndNullableResultPaths(expected ...[2]string) func(int, []byte) error {
+	return func(status int, body []byte) error {
+		if err := ExpectStatus(status, 200); err != nil {
+			return err
+		}
+		var envelope struct {
+			Result json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			return fmt.Errorf("decode body: %v", err)
+		}
+		result := bytes.TrimSpace(envelope.Result)
+		if len(result) == 0 {
+			return fmt.Errorf("missing result")
+		}
+		if bytes.Equal(result, []byte("null")) {
+			return nil
+		}
+		for _, item := range expected {
+			if err := ExpectPath(body, item[0], item[1]); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 }
 
@@ -38,6 +268,7 @@ func statusAndPath(path, typ string) func(int, []byte) error {
 //
 // These are read-only. Order execution stays on the official path (writes.go).
 func wtsOperations() []Operation {
+	todayKST := time.Now().In(time.FixedZone("KST", 9*60*60)).Format("2006-01-02")
 	return []Operation{
 		{
 			ID: "market_indices", Method: "GET", Path: "wts:market/indices", Backend: "wts",
@@ -51,11 +282,26 @@ func wtsOperations() []Operation {
 		},
 		{
 			ID: "index_detail", Method: "GET", Path: "wts:market/index", Backend: "wts",
-			Category: "market", Summary: "Index detail quote (OHLC, 52w high/low) by code or name. WTS-only.",
+			Category: "market", Summary: "Index detail quote (OHLC, 52w range, session hours/open state, realtime or delayed feed) by code or name. WTS-only.",
 			Params: []Param{{Name: "query", Type: "string", Required: true, Desc: `index code or name, e.g. "nasdaq" or "코스피"`}},
 			Probe: &ProbeSpec{Name: "index-prices", Method: "GET",
-				URL:   probeInfo + "/api/v1/index-prices/KGG01P",
-				Check: statusAndPath("result.close", "number")},
+				URL: probeInfo + "/api/v1/index-prices/KGG01P",
+				Check: statusAndPaths(
+					[2]string{"result.open", "number"},
+					[2]string{"result.high", "number"},
+					[2]string{"result.low", "number"},
+					[2]string{"result.close", "number"},
+					[2]string{"result.base", "number"},
+				)},
+			ExtraProbes: []ProbeSpec{{Name: "index-info", Method: "GET",
+				URL: probeInfo + "/api/v2/index-infos/KGG01P",
+				Check: statusAndPaths(
+					[2]string{"result.priceFeedType.code", "string"},
+					[2]string{"result.priceFeedType.description", "string"},
+					[2]string{"result.tradingStartAt", "string"},
+					[2]string{"result.tradingEndAt", "string"},
+					[2]string{"result.isMarketOpen", "bool"},
+				)}},
 			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
 				query, err := argString(args, "query")
 				if err != nil {
@@ -120,6 +366,30 @@ func wtsOperations() []Operation {
 			},
 		},
 		{
+			ID: "sector_detail", Method: "GET", Path: "wts:market/sector", Backend: "wts", Domain: "securities",
+			Category: "market", Summary: "One TICS sector's overview plus the server-default first page of constituent stocks, related ETFs, and news, with total counts. WTS-only.",
+			Params: []Param{{Name: "id", Type: "integer", Required: true, Desc: "sector id from sectors"}},
+			Probe: &ProbeSpec{Name: "sector-detail-overview", Method: "GET",
+				URL:   probeInfo + "/api/v2/dashboard/wts/overview/tics/1/overview",
+				Check: statusAndPath("result.ticsId", "number")},
+			ExtraProbes: []ProbeSpec{
+				{Name: "sector-detail-simple", Method: "GET", URL: probeInfo + "/api/v2/dashboard/wts/overview/tics/1/simple", Check: statusAndPaths([2]string{"result.ticsId", "number"}, [2]string{"result.changeRate", "number"})},
+				{Name: "sector-detail-stocks", Method: "POST", URL: probeInfo + "/api/v2/dashboard/wts/overview/tics/1/stocks", Body: `{}`, Check: statusAndPaths([2]string{"result.stocks", "array"}, [2]string{"result.totalCount", "number"})},
+				{Name: "sector-detail-etfs", Method: "POST", URL: probeInfo + "/api/v2/dashboard/wts/overview/tics/1/etfs", Body: `{}`, Check: statusAndPaths([2]string{"result.etfs", "array"}, [2]string{"result.totalCount", "number"})},
+				{Name: "sector-detail-news", Method: "GET", URL: probeInfo + "/api/v2/dashboard/wts/overview/tics/1/news", Check: statusAndPaths([2]string{"result.body", "array"}, [2]string{"result.totalCount", "number"})},
+			},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				id, err := argInt(args, "id")
+				if err != nil {
+					return nil, err
+				}
+				if id <= 0 {
+					return nil, fmt.Errorf("parameter %q must be greater than zero", "id")
+				}
+				return d.WTS.GetSectorDetail(ctx, id)
+			},
+		},
+		{
 			ID: "ai_signals", Method: "GET", Path: "wts:market/signals", Backend: "wts",
 			Category: "market", Summary: "Toss AI trading signals. WTS-only.",
 			Probe: &ProbeSpec{Name: "ai-signals", Method: "GET",
@@ -127,6 +397,39 @@ func wtsOperations() []Operation {
 				Check: statusAndPath("result.data", "array")},
 			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
 				return d.WTS.GetAISignals(ctx)
+			},
+		},
+		{
+			ID: "ai_signal_detail", Method: "GET", Path: "wts:market/signal", Backend: "wts", Domain: "securities",
+			Category: "market", Summary: "Full current AI reasoning for one stock or equity ETF, including evidence, news, and related-company flows. WTS-only.",
+			Params: []Param{
+				{Name: "symbol", Type: "string", Required: true, Desc: "ticker or Toss product code"},
+				{Name: "product_type", Type: "string", Desc: `"stocks" (default) or "equity_etf"; the asset_type returned by a briefing can also be used`},
+			},
+			// A product can legitimately have no current signal. The probe accepts
+			// result:null, but validates the detail schema whenever a signal is active.
+			// Runtime calls preserve the null case as Found=false.
+			Probe: &ProbeSpec{Name: "ai-signal-detail", Method: "GET",
+				URL: probeInfo + "/api/v1/dashboard/wts/overview/ai-signals/detail?productCode=A005930&productType=STOCKS",
+				Check: statusAndNullableResultPaths(
+					[2]string{"result.signalId", "string"},
+					[2]string{"result.reasoning.issue.assetCode", "string"},
+					[2]string{"result.reasoning.news.data", "array"},
+					[2]string{"result.relatedReasoning.details", "array"},
+				)},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				symbol, err := argString(args, "symbol")
+				if err != nil {
+					return nil, err
+				}
+				productType, err := argString(args, "product_type")
+				if err != nil {
+					return nil, err
+				}
+				if productType == "" {
+					productType = "stocks"
+				}
+				return d.WTS.GetAISignalDetail(ctx, symbol, productType)
 			},
 		},
 		{
@@ -172,13 +475,43 @@ func wtsOperations() []Operation {
 			},
 		},
 		{
+			ID: "earning_call_detail", Method: "GET", Path: "wts:market/earnings/{event_id}", Backend: "wts", Domain: "securities",
+			Category: "market", Summary: "Earnings-call report metadata and published audio, transcript, and slide links. WTS-only.",
+			Params: []Param{{Name: "event_id", Type: "integer", Required: true, Desc: "event id returned by earning_calls"}},
+			Probe: &ProbeSpec{Name: "earning-call-detail", Method: "GET",
+				URL:   probeCert + "/api/v1/earning-call/events/228692/info",
+				Check: statusAndPath("result.eventId", "number")},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				eventID, err := argInt(args, "event_id")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.GetEarningCallDetail(ctx, int64(eventID))
+			},
+		},
+		{
 			ID: "news_briefing", Method: "GET", Path: "wts:market/briefing", Backend: "wts",
-			Category: "market", Summary: "Personalized AI news briefing (headlines grouped by theme). WTS-only.",
+			Category: "market", Summary: "Personalized AI briefing enriched with the related holding/watchlist asset, return, signal direction, reasoning title, and source headlines. WTS-only.",
 			Probe: &ProbeSpec{Name: "news-briefing", Method: "GET",
-				URL:   probeInfo + "/api/v1/dashboard/wts/overview/ai-signals/personalized",
+				URL:   probeCert + "/api/v2/reasoning/personalized",
 				Check: statusAndPath("result.items", "array")},
 			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
 				return d.WTS.GetNewsBriefing(ctx)
+			},
+		},
+		{
+			ID: "market_news_briefing", Method: "GET", Path: "wts:market/briefing/latest", Backend: "wts", Domain: "securities",
+			Category: "market", Summary: "Latest non-personalized AI briefing for the Korean or US market. WTS-only.",
+			Params: []Param{{Name: "market", Type: "string", Required: true, Desc: `"kr" or "us"`}},
+			Probe: &ProbeSpec{Name: "market-news-briefing", Method: "GET",
+				URL:   probeCert + "/api/v1/dashboard/wts/overview/ai-signals/latest?nationCode=KOR",
+				Check: statusAndPath("result.items", "array")},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				market, err := argString(args, "market")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.GetMarketNewsBriefing(ctx, market)
 			},
 		},
 		{
@@ -206,6 +539,24 @@ func wtsOperations() []Operation {
 				}},
 			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
 				return d.WTS.GetLendingExpected(ctx)
+			},
+		},
+		{
+			ID: "lending_top_revenue", Method: "GET", Path: "wts:lending/revenue/top", Backend: "wts", Domain: "securities",
+			Category: "account", Summary: "Anonymized share-lending revenue ranking in server order. WTS-only.",
+			Params: []Param{{Name: "size", Type: "integer", Desc: "number of rows (0 = all returned by server)"}},
+			Probe: &ProbeSpec{Name: "lending-top-revenue", Method: "GET",
+				URL:   probeCert + "/api/v1/lending/revenue/account/top-revenue",
+				Check: statusAndPath("result.items", "array")},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				size, err := argInt(args, "size")
+				if err != nil {
+					return nil, err
+				}
+				if size < 0 {
+					return nil, fmt.Errorf("parameter %q must be zero or greater", "size")
+				}
+				return d.WTS.GetTopLendingRevenue(ctx, size)
 			},
 		},
 		{
@@ -244,6 +595,207 @@ func wtsOperations() []Operation {
 				}},
 			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
 				return d.WTS.GetProfitOverview(ctx)
+			},
+		},
+		{
+			ID: "portfolio_performance", Method: "GET", Path: "wts:portfolio/performance", Backend: "wts", Domain: "securities",
+			Category: "portfolio", Summary: "One-month daily portfolio valuation trend: principal, evaluated amount, return, range high/low, and realtime point. Omit account for the all-account aggregate. WTS-only; no web UI.",
+			Params: []Param{{Name: "account", Type: "string", Desc: "specific Securities account key; omit for all accounts"}},
+			Probe: &ProbeSpec{Name: "asset-performance-all", Method: "GET",
+				URL: probeCert + "/api/v1/asset-snapshot/all-accounts/chart/ONE_MONTH/DAY",
+				Check: statusAndPaths(
+					[2]string{"result.points", "array"},
+					[2]string{"result.evaluatedAmountDiff", "object"},
+					[2]string{"result.maxEvaluated", "object"},
+					[2]string{"result.minEvaluated", "object"},
+				)},
+			ExtraProbes: []ProbeSpec{{Name: "asset-performance-account", Method: "GET", AccountScoped: true,
+				URL: probeCert + "/api/v1/asset-snapshot/chart/ONE_MONTH/DAY",
+				Check: statusAndPaths(
+					[2]string{"result.points", "array"},
+					[2]string{"result.evaluatedAmountDiff", "object"},
+				)}},
+			ProbeRefs: []string{"account-list"},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				account, err := argString(args, "account")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.GetAssetPerformance(ctx, account)
+			},
+		},
+		{
+			ID: "portfolio_snapshots", Method: "GET", Path: "wts:portfolio/snapshots", Backend: "wts", Domain: "securities",
+			Category: "portfolio", Summary: "Cursor page of dated portfolio valuations with principal, evaluated amount, profit/loss, return, and completeness. Omit account for all accounts. WTS-only; no web UI.",
+			Params: []Param{
+				{Name: "account", Type: "string", Desc: "specific Securities account key; omit for all accounts"},
+				{Name: "cursor", Type: "string", Desc: "cursor from the previous next_cursor"},
+				{Name: "limit", Type: "integer", Desc: "history rows per page; 0 = 20 (the current realtime point can be additional)"},
+			},
+			Probe: &ProbeSpec{Name: "asset-snapshots-all", Method: "GET",
+				URL:   probeCert + "/api/v1/asset-snapshot/all-accounts/page?pageSize=1",
+				Check: statusAndCursorPage()},
+			ExtraProbes: []ProbeSpec{{Name: "asset-snapshots-account", Method: "GET", AccountScoped: true,
+				URL:   probeCert + "/api/v1/asset-snapshot/page?pageSize=1",
+				Check: statusAndCursorPage()}},
+			ProbeRefs: []string{"account-list"},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				account, err := argString(args, "account")
+				if err != nil {
+					return nil, err
+				}
+				cursor, err := argString(args, "cursor")
+				if err != nil {
+					return nil, err
+				}
+				limit, err := argInt(args, "limit")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.ListAssetSnapshots(ctx, account, cursor, limit)
+			},
+		},
+		{
+			ID: "portfolio_snapshot", Method: "GET", Path: "wts:portfolio/snapshot/{date}", Backend: "wts", Domain: "securities",
+			Category: "portfolio", Summary: "Complete dated valuation by market (KR stocks, US stocks, US options, bonds) and holding. Omit account for all accounts. WTS-only; no web UI.",
+			Params: []Param{
+				{Name: "date", Type: "string", Required: true, Desc: "base date in YYYY-MM-DD"},
+				{Name: "account", Type: "string", Desc: "specific Securities account key; omit for all accounts"},
+			},
+			Probe: &ProbeSpec{Name: "asset-snapshot-detail-all", Method: "GET",
+				URL: probeCert + "/api/v1/asset-snapshot/all-accounts/detail-by-date?baseDate=" + todayKST,
+				Check: statusAndPaths(
+					[2]string{"result.baseDate", "string"},
+					[2]string{"result.kr.items", "array"},
+					[2]string{"result.option.items", "array"},
+					[2]string{"result.us.items", "array"},
+					[2]string{"result.bond.items", "array"},
+				)},
+			ExtraProbes: []ProbeSpec{{Name: "asset-snapshot-detail-account", Method: "GET", AccountScoped: true,
+				URL: probeCert + "/api/v1/asset-snapshot/detail-by-date?baseDate=" + todayKST,
+				Check: statusAndPaths(
+					[2]string{"result.baseDate", "string"},
+					[2]string{"result.kr.items", "array"},
+					[2]string{"result.us.items", "array"},
+				)}},
+			ProbeRefs: []string{"account-list"},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				date, err := argString(args, "date")
+				if err != nil {
+					return nil, err
+				}
+				account, err := argString(args, "account")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.GetAssetSnapshot(ctx, account, date)
+			},
+		},
+		{
+			ID: "portfolio_folders", Method: "POST", Path: "wts:POST /api/v2/dashboard/asset/sections/all", Backend: "wts", Domain: "securities",
+			Category: "portfolio", Summary: "Grouped Securities holdings with default and user-defined folders, fees, and after-fee returns for one account. Session-bound folder and item keys are not returned. WTS-only.",
+			Params: []Param{{Name: "account", Type: "string", Desc: "Securities account key; primary account when omitted"}},
+			Probe: &ProbeSpec{
+				Name: "portfolio-folders", Method: "POST", AccountScoped: true,
+				URL: probeCert + "/api/v2/dashboard/asset/sections/all", Body: `{"types":["FOLDER_OVERVIEW_V2"]}`,
+				Check: func(status int, body []byte) error {
+					if err := ExpectStatus(status, 200); err != nil {
+						return err
+					}
+					var env struct {
+						Result struct {
+							Sections []struct {
+								Type string          `json:"type"`
+								Data json.RawMessage `json:"data"`
+							} `json:"sections"`
+						} `json:"result"`
+					}
+					if err := json.Unmarshal(body, &env); err != nil {
+						return fmt.Errorf("decode sections: %v", err)
+					}
+					for _, section := range env.Result.Sections {
+						if section.Type != "FOLDER_OVERVIEW_V2" {
+							continue
+						}
+						for _, expected := range [][2]string{
+							{"folders", "array"},
+							{"hiddenStock.count", "number"},
+							{"hiddenStock.all", "bool"},
+							{"hiddenStock.amount", "number"},
+							{"evaluatedAmountAfterFees.krw", "number"},
+							{"evaluatedAmountAfterFees.usd", "number"},
+							{"profitLossAmountAfterFees.krw", "number"},
+							{"profitLossAmountAfterFees.usd", "number"},
+						} {
+							if err := ExpectPath(section.Data, expected[0], expected[1]); err != nil {
+								return err
+							}
+						}
+						var data struct {
+							Folders []json.RawMessage `json:"folders"`
+						}
+						if err := json.Unmarshal(section.Data, &data); err != nil {
+							return fmt.Errorf("decode portfolio folders: %v", err)
+						}
+						for index, folder := range data.Folders {
+							for _, expected := range [][2]string{
+								{"folderName", "string"},
+								{"folderType", "string"},
+								{"evaluatedAmountAfterFees.krw", "number"},
+								{"evaluatedAmountAfterFees.usd", "number"},
+								{"profitLossAmountAfterFees.krw", "number"},
+								{"profitLossAmountAfterFees.usd", "number"},
+							} {
+								if err := ExpectPath(folder, expected[0], expected[1]); err != nil {
+									return fmt.Errorf("folders[%d].%w", index, err)
+								}
+							}
+							var folderData struct {
+								Name  string          `json:"folderName"`
+								Type  string          `json:"folderType"`
+								Items json.RawMessage `json:"items"`
+							}
+							if err := json.Unmarshal(folder, &folderData); err != nil {
+								return fmt.Errorf("decode folders[%d]: %v", index, err)
+							}
+							if strings.TrimSpace(folderData.Name) == "" || strings.TrimSpace(folderData.Type) == "" {
+								return fmt.Errorf("folders[%d] folderName and folderType must be non-empty", index)
+							}
+							var items []json.RawMessage
+							if len(folderData.Items) == 0 || string(folderData.Items) == "null" || json.Unmarshal(folderData.Items, &items) != nil || items == nil {
+								return fmt.Errorf("folders[%d].items must be an array", index)
+							}
+							for itemIndex, item := range items {
+								var identity struct {
+									ProductCode string `json:"stockCode"`
+								}
+								if err := json.Unmarshal(item, &identity); err != nil || strings.TrimSpace(identity.ProductCode) == "" {
+									return fmt.Errorf("folders[%d].items[%d] missing stockCode", index, itemIndex)
+								}
+								for _, expected := range [][2]string{
+									{"evaluatedAmountAfterFees.krw", "number"},
+									{"evaluatedAmountAfterFees.usd", "number"},
+									{"profitLossAmountAfterFees.krw", "number"},
+									{"profitLossAmountAfterFees.usd", "number"},
+								} {
+									if err := ExpectPath(item, expected[0], expected[1]); err != nil {
+										return fmt.Errorf("folders[%d].items[%d].%w", index, itemIndex, err)
+									}
+								}
+							}
+						}
+						return nil
+					}
+					return fmt.Errorf("FOLDER_OVERVIEW_V2 section not found")
+				},
+			},
+			ProbeRefs: []string{"account-list"},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				account, err := argString(args, "account")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.ListPortfolioFolders(ctx, account)
 			},
 		},
 		{
@@ -312,6 +864,25 @@ func wtsOperations() []Operation {
 					return nil, err
 				}
 				return d.WTS.GetMarketCalendar(ctx, month)
+			},
+		},
+		{
+			ID: "market_key_events", Method: "GET", Path: "wts:calendar/ai-summary/key-events", Backend: "wts",
+			Category: "market",
+			Summary:  "Current curated earnings and economic releases, including estimates and actual/forecast/historical values. WTS-only.",
+			Probe: &ProbeSpec{Name: "market-key-events", Method: "GET",
+				URL: probeCert + "/api/v1/calendar/ai-summary/key-events",
+				Check: func(status int, body []byte) error {
+					if err := ExpectStatus(status, 200); err != nil {
+						return err
+					}
+					if err := ExpectPath(body, "result.earnings", "array"); err != nil {
+						return err
+					}
+					return ExpectPath(body, "result.eci.indicators", "array")
+				}},
+			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
+				return d.WTS.GetMarketKeyEvents(ctx)
 			},
 		},
 		{
@@ -713,6 +1284,39 @@ func wtsOperations() []Operation {
 			},
 		},
 		{
+			ID: "account_access_status", Method: "GET", Path: "wts:account/access-status", Backend: "wts", Domain: "securities",
+			Category: "account",
+			Summary:  "User-global last Toss Securities login context plus account-specific margin-freeze and accident-account signals. Read-only; does not unlock or modify the account. WTS-only.",
+			Params:   []Param{{Name: "account", Type: "string", Desc: "Securities account key; omit for the primary account"}},
+			Probe: &ProbeSpec{Name: "account-last-login", Method: "GET",
+				URL: probeAPI + "/api/v1/user/last-login-info",
+				Check: func(status int, body []byte) error {
+					if err := ExpectStatus(status, 200); err != nil {
+						return err
+					}
+					for _, item := range [][2]string{{"channel", "string"}, {"osName", "string"}, {"agentName", "string"}, {"timestamp", "string"}} {
+						if err := ExpectPath(body, "result."+item[0], item[1]); err != nil {
+							return err
+						}
+					}
+					return nil
+				}},
+			ExtraProbes: []ProbeSpec{
+				{Name: "account-margin-frozen", Method: "GET", URL: probeCert + "/api/v1/margin/cert/frozen-account", AccountScoped: true,
+					Check: statusAndPath("result.isFrozen", "bool")},
+				{Name: "account-accident-count", Method: "GET", URL: probeAPI + "/api/v2/account/unlock/accident-account/count", AccountScoped: true,
+					Check: statusAndPath("result", "number")},
+			},
+			ProbeRefs: []string{"account-list"},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				account, err := argString(args, "account")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.GetAccountAccessStatus(ctx, account)
+			},
+		},
+		{
 			ID: "account_commission", Method: "GET", Path: "wts:account/commission", Backend: "wts",
 			Category: "account", Summary: "Commission schedule this account is charged, per market (KR equities, US equities, US options). Distinct from quote_commission, which is per-symbol. WTS-only.",
 			Probe: &ProbeSpec{Name: "account-commission-info", Method: "GET",
@@ -755,6 +1359,182 @@ func wtsOperations() []Operation {
 				}},
 			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
 				return d.WTS.GetAccountSummary(ctx)
+			},
+		},
+		{
+			ID: "account_overview", Method: "POST", Path: "wts:account/overview", Backend: "wts",
+			Category: "account", Summary: "All-account asset rollup, including minor accounts and pending-order counts. Account numbers are masked unless full=true. WTS-only.",
+			Params: []Param{{Name: "full", Type: "boolean", Desc: "reveal complete account numbers; false/omitted masks them"}},
+			Probe: &ProbeSpec{Name: "account-all-overview", Method: "POST",
+				URL:  probeInfo + "/api/v1/dashboard/all-accounts",
+				Body: `{"sections":["SUMMARY_WITH_MINOR"]}`,
+				Check: func(status int, body []byte) error {
+					if err := ExpectStatus(status, 200); err != nil {
+						return err
+					}
+					if err := ExpectPath(body, "result.0.data.accountOverviews", "array"); err != nil {
+						return err
+					}
+					if err := ExpectPath(body, "result.0.data.minorAccountOverviews", "array"); err != nil {
+						return err
+					}
+					return ExpectPath(body, "result.0.data.totalAssetAmount", "number")
+				}},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				full, err := argBool(args, "full")
+				if err != nil {
+					return nil, err
+				}
+				value, err := d.WTS.GetAccountOverview(ctx)
+				if err != nil || full {
+					return value, err
+				}
+				return privacy.RedactAccountOverview(value), nil
+			},
+		},
+		{
+			ID: "trading_settings", Method: "GET", Path: "wts:account/trading-settings", Backend: "wts", Domain: "securities",
+			Category:  "settings",
+			Summary:   "Read-only Securities trading preferences: account-specific simple trade plus user-wide KRX/NXT execution venue, ATS notifications, and option real-time tick subscription flags. WTS-only; not general Toss Banking.",
+			Params:    []Param{{Name: "account", Type: "string", Desc: "Securities account key; primary account when omitted"}},
+			ProbeRefs: []string{"account-list"},
+			Probe: &ProbeSpec{Name: "trading-exchange-choice", Method: "GET",
+				URL:   probeCert + "/api/v2/trading/settings/investor-exchange-choice-type",
+				Check: statusAndPath("result", "string")},
+			ExtraProbes: []ProbeSpec{
+				{Name: "trading-simple-trade", Method: "GET", AccountScoped: true,
+					URL:   probeCert + "/api/v1/trading/settings/simple-trade",
+					Check: statusAndPath("result", "bool")},
+				{Name: "trading-ats-notification", Method: "GET",
+					URL:   probeCert + "/api/v1/users/settings/me/ats-notification",
+					Check: statusAndPath("result", "bool")},
+				{Name: "option-real-time-tick", Method: "GET",
+					URL: probeCert + "/api/v1/member-subscriptions/get-option-real-time-tick",
+					Check: statusAndPaths(
+						[2]string{"result.requested", "bool"},
+						[2]string{"result.serviced", "bool"},
+						[2]string{"result.shouldCharged", "bool"},
+					)},
+			},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				account, err := argString(args, "account")
+				if err != nil {
+					return nil, err
+				}
+				return d.WTS.GetTradingSettings(ctx, account)
+			},
+		},
+		{
+			ID: "securities_transfer_accounts", Method: "GET", Path: "wts:account/transfer-accounts", Backend: "wts", Domain: "securities",
+			Category: "account",
+			Summary:  "Own and recent destination accounts from the Securities stock-transfer flow. Read-only; account numbers are masked unless full=true. WTS-only; not general Toss Banking.",
+			Params: []Param{
+				{Name: "account", Type: "string", Desc: "Securities account key; primary account when omitted"},
+				{Name: "full", Type: "boolean", Desc: "reveal complete account numbers; false/omitted masks them"},
+			},
+			ProbeRefs: []string{"account-list"},
+			Probe: &ProbeSpec{Name: "securities-transfer-my-accounts", Method: "GET", AccountScoped: true,
+				URL: probeCert + "/api/v1/securities-transfer/my-accounts",
+				Check: statusAndOptionalArrayItemPaths(
+					[2]string{"bankCode", "string"},
+					[2]string{"accountNo", "string"},
+					[2]string{"accountId", "string"},
+				)},
+			ExtraProbes: []ProbeSpec{
+				{Name: "securities-transfer-recent-accounts", Method: "GET", AccountScoped: true,
+					URL: probeCert + "/api/v1/securities-transfer/recent-accounts",
+					Check: statusAndOptionalArrayItemPaths(
+						[2]string{"bankCode", "string"},
+						[2]string{"accountNo", "string"},
+					)},
+			},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				account, err := argString(args, "account")
+				if err != nil {
+					return nil, err
+				}
+				full, err := argBool(args, "full")
+				if err != nil {
+					return nil, err
+				}
+				value, err := d.WTS.GetSecuritiesTransferAccounts(ctx, account)
+				if err != nil || full {
+					return value, err
+				}
+				return privacy.RedactSecuritiesTransferAccounts(value), nil
+			},
+		},
+		{
+			ID: "accumulation_funding_status", Aliases: []string{"banking_status"}, Method: "GET", Path: "wts:autotrade/open-banking/info/find", Backend: "wts", Domain: "securities",
+			Category: "accumulate",
+			Summary:  "Funding account used by Securities stock accumulation and its automated-order funding registration. Not general Toss Banking. Holder and account are masked unless full=true; internal connection IDs are never emitted. WTS-only.",
+			Params:   []Param{{Name: "full", Type: "boolean", Desc: "reveal the account holder and complete account number; false/omitted masks them"}},
+			Probe: &ProbeSpec{Name: "open-banking-status", Method: "GET",
+				URL: probeAPI + "/api/v1/autotrade/open-banking/info/find",
+				Check: func(status int, body []byte) error {
+					if err := ExpectStatus(status, 200); err != nil {
+						return err
+					}
+					return ExpectPath(body, "result.savingCount", "number")
+				}},
+			ExtraProbes: []ProbeSpec{
+				{Name: "open-banking-creatable", Method: "GET",
+					URL:   probeAPI + "/api/v1/autotrade/open-banking/creatable",
+					Check: statusAndPath("result", "bool")},
+				{Name: "open-banking-registration", Method: "GET",
+					URL:   probeAPI + "/api/v1/autotrade/open-banking/need-registration",
+					Check: statusAndPath("result", "bool")},
+				{Name: "auto-trading-open-banking", Method: "GET",
+					URL: probeCert + "/api/v1/trading/open-banking/auto-trading",
+					Check: func(status int, body []byte) error {
+						if err := ExpectStatus(status, 200); err != nil {
+							return err
+						}
+						if err := ExpectPath(body, "result.connectedAccountBankCode", "string"); err != nil {
+							return err
+						}
+						return ExpectPath(body, "result.isRegistered", "bool")
+					}},
+			},
+			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
+				full, err := argBool(args, "full")
+				if err != nil {
+					return nil, err
+				}
+				value, err := d.WTS.GetOpenBankingStatus(ctx)
+				if err != nil || full {
+					return value, err
+				}
+				return privacy.RedactOpenBankingStatus(value), nil
+			},
+		},
+		{
+			ID: "notification_settings", Method: "GET", Path: "wts:user-alimies", Backend: "wts", Domain: "securities",
+			Category:  "settings",
+			Summary:   "Every WTS notification preference and its enabled state, including upstream untyped rows. Read-only; internal user ids are omitted. WTS-only.",
+			ProbeRefs: []string{"notification-settings"},
+			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
+				return d.WTS.GetNotificationSettings(ctx)
+			},
+		},
+		{
+			ID: "notification_status", Method: "GET", Path: "wts:notifications/status", Backend: "wts", Domain: "securities",
+			Category: "settings",
+			Summary:  "Inbox and selected AI/FOMC notification states summarized from the generic settings list, plus reasoning agreement and a deprecated global news-count field. Read-only. WTS-only.",
+			Probe: &ProbeSpec{Name: "notification-inbox-unread", Method: "GET",
+				URL:   probeCert + "/api/v1/inbox-alimies/has-unread",
+				Check: statusAndPath("result.unread", "bool")},
+			ExtraProbes: []ProbeSpec{
+				{Name: "notification-reasoning-agreement", Method: "GET",
+					URL:   probeCert + "/api/v1/reasoning/agreement",
+					Check: statusAndPath("result", "bool")},
+				{Name: "notification-reasoning-news-count", Method: "GET",
+					URL:   probeCert + "/api/v1/reasoning-news/count",
+					Check: statusAndPath("result", "number")},
+			},
+			ProbeRefs: []string{"notification-settings"},
+			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
+				return d.WTS.GetNotificationStatus(ctx)
 			},
 		},
 		{
@@ -952,7 +1732,8 @@ func wtsOperations() []Operation {
 			},
 			Probe: &ProbeSpec{Name: "watchlist", Method: "GET",
 				URL:   probeCert + "/api/v1/new-watchlists?includePrice=true&lazyLoad=false",
-				Check: statusAndPath("result.watchlists", "array")},
+				Check: statusAndWatchlistFolders(false)},
+			ProbeRefs: []string{"watchlist-group"},
 			handler: func(ctx context.Context, d *Deps, args map[string]any) (any, error) {
 				allFlag, err := argBool(args, "all")
 				if err != nil {
@@ -979,7 +1760,7 @@ func wtsOperations() []Operation {
 			Category: "watchlist", Summary: "Watchlist folders/groups. WTS-only.",
 			Probe: &ProbeSpec{Name: "watchlist-groups", Method: "GET",
 				URL:   probeCert + "/api/v1/new-watchlists/groups/simple?includeItemInfo=true",
-				Check: statusAndPath("result.watchlists", "array")},
+				Check: statusAndWatchlistGroupsSimple()},
 			handler: func(ctx context.Context, d *Deps, _ map[string]any) (any, error) {
 				return d.WTS.ListWatchlistGroups(ctx)
 			},

@@ -2,9 +2,13 @@ package config
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/JungHoonGhae/tossinvest-cli/internal/routing"
 )
 
 func TestStatusFallsBackToDefaultWhenConfigIsMissing(t *testing.T) {
@@ -307,6 +311,37 @@ func TestInitCreatesDangerousAutomationDefaults(t *testing.T) {
 	if result.Status.Trading.DangerousAutomation.AcceptFXConsent {
 		t.Fatal("expected accept_fx_consent to be disabled by default")
 	}
+	if result.Status.Experimental.PaperTrading {
+		t.Fatal("expected paper trading experiment to be disabled by default")
+	}
+}
+
+func TestExperimentalPaperTradingOptInPersistsAndCanBeDisabled(t *testing.T) {
+	t.Parallel()
+	service := NewService(filepath.Join(t.TempDir(), "config.json"))
+	if _, err := service.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetExperimentalPaperTrading(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := service.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Experimental.PaperTrading {
+		t.Fatal("expected paper trading experiment to be enabled")
+	}
+	if err := service.SetExperimentalPaperTrading(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = service.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Experimental.PaperTrading {
+		t.Fatal("expected paper trading experiment to be disabled")
+	}
 }
 
 func TestLoadDefaultsOpenAPI(t *testing.T) {
@@ -316,7 +351,7 @@ func TestLoadDefaultsOpenAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.OpenAPI.Enabled || cfg.OpenAPI.Prefer != "auto" || !cfg.OpenAPI.Fallback {
+	if !cfg.OpenAPI.Enabled || cfg.OpenAPI.Prefer != routing.Auto || !cfg.OpenAPI.Fallback {
 		t.Fatalf("unexpected openapi defaults: %+v", cfg.OpenAPI)
 	}
 }
@@ -342,7 +377,7 @@ func TestLoadOpenAPIFromExistingConfig(t *testing.T) {
 	if !cfg.OpenAPI.Enabled {
 		t.Fatal("expected openapi.enabled to be true")
 	}
-	if cfg.OpenAPI.Prefer != "openapi" {
+	if cfg.OpenAPI.Prefer != routing.OpenAPI {
 		t.Fatalf("expected prefer=openapi, got %q", cfg.OpenAPI.Prefer)
 	}
 	if cfg.OpenAPI.Fallback {
@@ -350,16 +385,47 @@ func TestLoadOpenAPIFromExistingConfig(t *testing.T) {
 	}
 }
 
-func TestLoadOpenAPINormalizesInvalidPrefer(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.json")
-	data := []byte(`{
+func TestLoadOpenAPIRejectsInvalidPrefer(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "unknown", raw: `"bogus"`},
+		{name: "empty", raw: `""`},
+		{name: "null", raw: `null`},
+		{name: "non-string", raw: `42`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.json")
+			data := []byte(fmt.Sprintf(`{
   "schema_version": 3,
   "trading": {},
   "openapi": {
     "enabled": true,
-    "prefer": "bogus",
+    "prefer": %s,
     "fallback": true
   }
+			}`, tt.raw))
+			if err := os.WriteFile(configPath, data, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			_, err := NewService(configPath).Load(context.Background())
+			if err == nil {
+				t.Fatal("expected invalid openapi.prefer to be rejected")
+			}
+			if !strings.Contains(err.Error(), "openapi.prefer") {
+				t.Fatalf("error should identify openapi.prefer, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadOpenAPIMissingPreferUsesDefault(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{
+  "schema_version": 3,
+  "trading": {},
+  "openapi": {"enabled": false}
 }`)
 	if err := os.WriteFile(configPath, data, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -368,8 +434,8 @@ func TestLoadOpenAPINormalizesInvalidPrefer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.OpenAPI.Prefer != "auto" {
-		t.Fatalf("expected invalid prefer to normalize to 'auto', got %q", cfg.OpenAPI.Prefer)
+	if cfg.OpenAPI.Prefer != routing.Auto {
+		t.Fatalf("missing openapi.prefer should use %q, got %q", routing.Auto, cfg.OpenAPI.Prefer)
 	}
 }
 
@@ -384,7 +450,7 @@ func TestLoadOpenAPIMissingBlockDefaultsApplied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !cfg.OpenAPI.Enabled || cfg.OpenAPI.Prefer != "auto" || !cfg.OpenAPI.Fallback {
+	if !cfg.OpenAPI.Enabled || cfg.OpenAPI.Prefer != routing.Auto || !cfg.OpenAPI.Fallback {
 		t.Fatalf("expected defaults when openapi block missing, got: %+v", cfg.OpenAPI)
 	}
 }
